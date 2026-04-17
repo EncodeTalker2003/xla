@@ -602,6 +602,47 @@ xla_cc_test(
 )
 
 cc_library(
+    name = "xla_slicer_lib",
+    srcs = ["xla_slicer.cc"],
+    hdrs = ["xla_slicer.h"],
+    deps = [
+			  ":hlo_slicer",  # 修复 xla_slicer.cc 包含 hlo_slicer.h 的报错
+        "//xla:xla_data_proto_cc", # 修复 xla_slicer.cc 包含 xla_data.pb.h
+        "//xla/hlo/ir:hlo",
+        "//xla/service:pattern_matcher",
+        "//xla:shape_util",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+xla_cc_binary(
+    name = "xla_slicer",
+    testonly = True,
+    srcs = ["xla_slicer_main.cc"],
+    tags = [
+        "noasan",
+    ],
+    deps = [
+        ":xla_slicer_lib",
+        ":hlo_extractor",  # 修复 xla_slicer_main.cc 包含 hlo_extractor.h 
+        ":hlo_slicer",     # 修复 xla_slicer_main.cc 包含 hlo_slicer.h
+        ":hlo_module_loader",
+        "//xla/hlo/ir:hlo", # 修复用到 HloComputation/HloInstruction 等
+        "//xla/service:hlo_verifier",
+        "//xla/tsl/platform:errors", # 修复包含 errors.h
+        "//xla/tsl/platform:statusor",
+        "//xla/tsl/util:command_line_flags",
+        "@com_google_absl//absl/container:flat_hash_set", # 修复主程序缺失的集合依赖
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/status",
+        "@tsl//tsl/platform",
+    ],
+)
+
+cc_library(
     name = "hlo_control_flow_flattening",
     srcs = ["hlo_control_flow_flattening.cc"],
     hdrs = ["hlo_control_flow_flattening.h"],
