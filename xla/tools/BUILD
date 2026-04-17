@@ -602,6 +602,72 @@ xla_cc_test(
 )
 
 cc_library(
+    name = "hlo_comp_lib",
+    srcs = [ "hlo_comp.cc" ],
+    hdrs = [ "hlo_comp.h" ],
+    deps = [
+        "//xla/hlo/ir:hlo",
+        "//xla/service:pattern_matcher",
+        "//xla:shape_util",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+xla_cc_binary(
+    name = "hlo_comp",
+    testonly = True,
+    srcs = [ "hlo_comp_main.cc" ],
+    tags = [
+        "noasan",
+    ],
+    deps = [
+        # 工具自身的依赖
+        ":hlo_comp_lib",
+        ":hlo_module_loader",
+        
+        # 核心数据结构与比对逻辑
+        "//xla:error_spec",
+        "//xla:literal",
+        "//xla:literal_comparison",
+        "//xla:shape_util",
+        
+        # 运行时与平台调度
+        "//xla/service:hlo_runner",
+        "//xla/service:hlo_verifier",
+        "//xla/service:platform_util",
+        
+        # 随机参数生成工具
+        "//xla/tests:test_utils",
+        
+        # 硬件平台后端插件 (必须链接，否则运行时找不到平台)
+        "//xla/service:cpu_plugin",
+        "//xla/service:interpreter_plugin",
+        
+        # 错误处理与命令行解析
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
+        "//xla/tsl/util:command_line_flags",
+        
+        # 基础库
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@tsl//tsl/platform:path",
+        "@tsl//tsl/platform:platform_port",
+    ] + if_gpu_is_configured([
+        "//xla/service:gpu_plugin",
+    ]) + if_cuda([
+        "//xla/stream_executor:cuda_platform",
+    ]) + if_rocm([
+        "//xla/stream_executor:rocm_platform",
+    ]) + if_sycl_is_configured([
+        "//xla/stream_executor:sycl_platform",
+    ]),
+)
+
+cc_library(
     name = "xla_slicer_lib",
     srcs = ["xla_slicer.cc"],
     hdrs = ["xla_slicer.h"],

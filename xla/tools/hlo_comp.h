@@ -10,11 +10,12 @@
 namespace xla {
 
 
-struct XlaSlicerConfig {
+struct HloCompConfig {
   std::string lhs_file{""};
   std::string rhs_file{""};
   std::string input_format{""};
-  // Slicing depth, etc ...
+  std::string platform;
+  int iterations{1};
 };
 
 }  // namespace xla
