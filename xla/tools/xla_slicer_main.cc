@@ -91,7 +91,7 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
       bfs_queue.pop();
 
       // 如果当前指令的深度已经达到 5，停止向其 operands 扩展
-      if (depth >= 5) {
+      if (depth >= opts.depth) {
         continue;
       }
 
@@ -109,7 +109,7 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
         }
 
         // 如果指令总数已满 15，停止吸收新节点
-        if (valid_set.size() >= 15) {
+        if (valid_set.size() >= opts.max_inst_count) {
           break; 
         }
 
@@ -119,7 +119,7 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
       }
       
       // 再次检查，防止内部循环 break 后外层队列继续处理
-      if (valid_set.size() >= 15) {
+      if (valid_set.size() >= opts.max_inst_count) {
         break;
       }
     }
@@ -160,6 +160,11 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
     }
     
     std::string output_filename = absl::StrCat("sliced_", slice_index, "_", safe_name, ".hlo");
+		// save the file to the output directory if specified
+		if (!opts.output_dir.empty()) {
+			output_filename = tsl::io::JoinPath(opts.output_dir, output_filename);
+    }
+
     std::ofstream out_file(output_filename);
     if (out_file.is_open()) {
       out_file << extracted_module->ToString();
@@ -187,7 +192,11 @@ int main(int argc, char** argv) {
                 "  mhlo : MHLO in textual or bytecode format\n"
                 "  pb : xla::HloProto in binary proto format\n"
                 "  pbtxt : xla::HloProto in text proto format\n"
-                "  stablehlo : StableHLO in textual or bytecode format")};
+                "  stablehlo : StableHLO in textual or bytecode format"),
+			tsl::Flag("depth", &opts.depth, "The maximum depth for BFS traversal when slicing."),
+			tsl::Flag("max_inst_count", &opts.max_inst_count, "The maximum number of instructions to include in each slice."),
+			tsl::Flag("output_dir", &opts.output_dir, "The directory to save the sliced modules. Defaults to current directory.")};
+			
   // The usage string includes the message at the top of the file and the flags
   // defined above.
   const std::string kUsageString =
@@ -201,8 +210,8 @@ int main(int argc, char** argv) {
   }
   tsl::port::InitMain(kUsageString.c_str(), &argc, &argv);
 
-  QCHECK(argc == 2) << "Must specify a single input file. Number of args: "
-                    << argc;
+  /* QCHECK(argc == 4) << "Must specify a single input file. Number of args: "
+                    << argc; */
   opts.input_file = argv[1];
 
   absl::Status status = xla::RunXlaSlicer(opts);

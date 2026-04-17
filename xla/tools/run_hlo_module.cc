@@ -151,22 +151,43 @@ absl::StatusOr<Literal> ExecuteWithRunner(
 
   std::cerr << "Running HLO module with runner " << runner->Name() << "...\n";
   XLA_VLOG_LINES(1, module->ToString());
-  const auto start = std::chrono::high_resolution_clock::now();
-  auto result_status =
-      (buffer_assignment_proto == nullptr)
-          ? runner->Execute(std::move(module), args, run_hlo_passes)
-          : runner->ExecuteWithBufferAssignment(std::move(module),
-                                                buffer_assignment_proto, args,
-                                                run_hlo_passes);
-  const auto end = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double> diff = end - start;
-  std::cerr << "... compiled and ran in " << diff.count() << "s.\n";
+  
+  const auto compile_start = std::chrono::high_resolution_clock::now();
+  TF_ASSIGN_OR_RETURN(
+      std::unique_ptr<OpaqueExecutable> executable,
+      buffer_assignment_proto == nullptr
+          ? runner->CreateExecutable(std::move(module), run_hlo_passes)
+          : runner->CreateExecutableWithBufferAssignment(
+                std::move(module), buffer_assignment_proto, run_hlo_passes));
+	ExecutionProfile profile;
 
-  TF_RETURN_WITH_CONTEXT_IF_ERROR(
-      result_status.status(),
-      absl::StrCat("Failed to execute on ", runner->Name()));
-
-  return std::move(result_status).value();
+  const auto compile_end = std::chrono::high_resolution_clock::now();
+	auto* hlo_runner = dynamic_cast<HloRunner*>(runner);
+	if (hlo_runner == nullptr) {
+		std::cerr << "Runner does not support profiling; skipping profile collection.";
+		TF_ASSIGN_OR_RETURN(
+			auto result,
+			runner->ExecuteWithExecutable(executable.get(), args));
+		return std::move(result);
+	} else {
+		std::vector<const Literal*> arg_ptrs;
+		arg_ptrs.reserve(args.size());
+		for (const auto& arg : args) {
+			arg_ptrs.push_back(&arg);
+		}
+		auto result_status = hlo_runner->ExecuteWithExecutableAndProfile(
+			executable.get(), arg_ptrs, &profile);
+		double run_time = static_cast<double>(profile.compute_time_ns()) / 1e6;
+		std::cerr
+				<< "... compiled in "
+				<< std::chrono::duration<double>(compile_end - compile_start).count()
+				<< "s, executed in "
+				<< run_time << "ms.\n";
+		TF_RETURN_WITH_CONTEXT_IF_ERROR(
+				result_status.status(),
+				absl::StrCat("Failed to execute on ", runner->Name()));
+		return std::move(result_status).value();
+	}
 }
 
 absl::Status RunAndCompareInternal(

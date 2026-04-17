@@ -1,5 +1,5 @@
-#ifndef XLA_TOOLS_XLA_SLICER_H_
-#define XLA_TOOLS_XLA_SLICER_H_
+#ifndef XLA_TOOLS_HLO_COMP_H_
+#define XLA_TOOLS_HLO_COMP_H_
 
 #include <memory>
 #include <string>
@@ -11,14 +11,12 @@ namespace xla {
 
 
 struct XlaSlicerConfig {
-  std::string input_file{""};
+  std::string lhs_file{""};
+  std::string rhs_file{""};
   std::string input_format{""};
-	int depth{5};
-	int max_inst_count{15};
-	std::string output_dir{"./"};
   // Slicing depth, etc ...
 };
 
 }  // namespace xla
 
-#endif  // XLA_TOOLS_XLA_SLICER_H_
+#endif  // XLA_TOOLS_HLO_COMP_H_
