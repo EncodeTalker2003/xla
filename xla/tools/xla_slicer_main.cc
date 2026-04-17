@@ -75,6 +75,7 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
   int slice_index = 0;
 
   // 第二步：遍历 main 函数中的每一条指令，作为切片的 ROOT
+	int inst_count_as_name = 0;
   for (HloInstruction* root_inst : entry_comp->instructions()) {
     
     // 初始化 BFS 队列和有效节点集合
@@ -152,22 +153,20 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
         /*cross_computation=*/true);
 
     // 第五步：将切片序列化并输出到独立文件中
-    // 文件名格式：sliced_0_opname.hlo
-    std::string safe_name = root_inst->ToString();
-    // 替换文件名中可能存在的非法字符 (如 % 或 .)
-    for (char& c : safe_name) {
-      if (c == '%' || c == '/' || c == '\\') c = '_';
-    }
-    
-    std::string output_filename = absl::StrCat("sliced_", slice_index, "_", safe_name, ".hlo");
+    // 文件名格式：{opts.name}_slice{slice_index}.hlo
+    std::string output_filename = absl::StrCat(opts.name, "_slice_", slice_index, ".hlo");
 		// save the file to the output directory if specified
 		if (!opts.output_dir.empty()) {
+			// Ensure the output directory exists
+			tsl::Env::Default()->RecursivelyCreateDir(opts.output_dir);
 			output_filename = tsl::io::JoinPath(opts.output_dir, output_filename);
     }
 
     std::ofstream out_file(output_filename);
     if (out_file.is_open()) {
-      out_file << extracted_module->ToString();
+      xla::HloPrintOptions print_options;
+      print_options.set_print_metadata(false);
+      out_file << extracted_module->ToString(print_options);
       out_file.close();
       std::cout << "Successfully saved slice to: " << output_filename << " (Instructions: " << valid_set.size() << ")" << std::endl;
     } else {
@@ -195,7 +194,8 @@ int main(int argc, char** argv) {
                 "  stablehlo : StableHLO in textual or bytecode format"),
 			tsl::Flag("depth", &opts.depth, "The maximum depth for BFS traversal when slicing."),
 			tsl::Flag("max_inst_count", &opts.max_inst_count, "The maximum number of instructions to include in each slice."),
-			tsl::Flag("output_dir", &opts.output_dir, "The directory to save the sliced modules. Defaults to current directory.")};
+			tsl::Flag("output_dir", &opts.output_dir, "The directory to save the sliced modules. Defaults to current directory."),
+		  tsl::Flag("name", &opts.name, "A name prefix for the output files. Defaults to 'default'.")};
 			
   // The usage string includes the message at the top of the file and the flags
   // defined above.
