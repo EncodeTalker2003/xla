@@ -603,8 +603,8 @@ xla_cc_test(
 
 cc_library(
     name = "hlo_comp_lib",
-    srcs = [ "hlo_comp.cc" ],
-    hdrs = [ "hlo_comp.h" ],
+    srcs = ["hlo_comp.cc"],
+    hdrs = ["hlo_comp.h"],
     deps = [
         "//xla/hlo/ir:hlo",
         "//xla/service:pattern_matcher",
@@ -618,7 +618,7 @@ cc_library(
 xla_cc_binary(
     name = "hlo_comp",
     testonly = True,
-    srcs = [ "hlo_comp_main.cc" ],
+    srcs = ["hlo_comp_main.cc"],
     tags = [
         "noasan",
     ],
@@ -637,6 +637,12 @@ xla_cc_binary(
         "//xla/service:hlo_runner",
         "//xla/service:hlo_verifier",
         "//xla/service:platform_util",
+        
+        # --- 新增：Cost Analysis 与硬件参数获取所需的依赖 ---
+        "//xla/service:compiler",
+        "//xla/service:hlo_cost_analysis",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor:stream_executor_h",
         
         # 随机参数生成工具
         "//xla/tests:test_utils",

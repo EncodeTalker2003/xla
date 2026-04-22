@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <memory>
@@ -12,10 +13,14 @@
 #include "xla/error_spec.h"
 #include "xla/literal.h"
 #include "xla/literal_comparison.h"
+#include "xla/service/compiler.h"
+#include "xla/service/hlo_cost_analysis.h"
 #include "xla/service/hlo_runner.h"
 #include "xla/service/hlo_verifier.h"
 #include "xla/service/platform_util.h"
 #include "xla/shape_util.h"
+#include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/stream_executor.h"
 #include "xla/tests/test_utils.h"
 #include "xla/tools/hlo_comp.h"
 #include "xla/tools/hlo_module_loader.h"
@@ -87,6 +92,63 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
   TF_ASSIGN_OR_RETURN(se::Platform* platform, PlatformUtil::GetPlatform(opts.platform));
   HloRunner runner(platform);
 
+  // --- 插入阶段：Cost Model 分析与耗时预估 ---
+  TF_ASSIGN_OR_RETURN(auto compiler, xla::Compiler::GetForPlatform(platform));
+  TF_ASSIGN_OR_RETURN(se::StreamExecutor* executor, platform->ExecutorForDevice(0));
+
+  // 定义一个 Lambda 函数来复用 Cost Analysis 的逻辑
+  auto run_cost_analysis = [&](const HloModule* module, const std::string& name) {
+    std::cerr << "Running HLO Passes for " << name << " Cost Analysis...\n";
+    std::unique_ptr<HloModule> cost_module = module->Clone();
+    xla::Compiler::CompileOptions compile_options;
+    auto pass_status = compiler->RunHloPasses(std::move(cost_module), executor, compile_options);
+
+    if (pass_status.ok()) {
+      std::unique_ptr<HloModule> optimized_module = std::move(pass_status).value();
+      // 使用标准的紧凑内存计算函数初始化 Cost Analysis
+      HloCostAnalysis cost_analysis([](const xla::Shape& shape) { 
+        return xla::ShapeUtil::ByteSizeOf(shape); 
+      });
+      if (optimized_module->entry_computation()->Accept(&cost_analysis).ok()) {
+        double total_flops = cost_analysis.flop_count();
+        double total_bytes = cost_analysis.bytes_accessed();
+
+        std::cerr << "[" << name << "] Total FLOPs: " << total_flops << "\n"
+                  << "[" << name << "] Total Bytes Accessed: " << total_bytes << "\n";
+
+        // 提取底层硬件信息
+        const se::DeviceDescription& dev_desc = executor->GetDeviceDescription();
+        int64_t memory_bandwidth = dev_desc.memory_bandwidth();
+        double clock_rate_ghz = dev_desc.clock_rate_ghz();
+        int core_count = dev_desc.core_count();
+
+        // 如果无法提取有效硬件参数则打印警告并跳过预估
+        if (memory_bandwidth <= 0 || clock_rate_ghz <= 0 || core_count <= 0) {
+          std::cerr << "Warning: Unable to fetch hardware peak parameters for Roofline model. Skipping estimated time calculation for " << name << ".\n";
+        } else {
+          // 假设现代 GPU 架构每个核心每个时钟周期可执行约 128 次浮点运算
+          double peak_flops_per_sec = clock_rate_ghz * 1e9 * core_count * 128.0;
+          double peak_bandwidth_bytes_per_sec = static_cast<double>(memory_bandwidth);
+
+          double time_compute_s = total_flops / peak_flops_per_sec;
+          double time_memory_s = total_bytes / peak_bandwidth_bytes_per_sec;
+
+          // 根据 Roofline 模型，执行时间由算力或访存的短板决定
+          double estimated_time_ms = std::max(time_compute_s, time_memory_s) * 1000.0;
+          std::cerr << "[" << name << "] Estimated execution time: " << estimated_time_ms << "ms\n";
+        }
+      }
+    } else {
+      std::cerr << "Warning: Failed to run HLO passes for " << name << " cost analysis.\n";
+    }
+  };
+
+  // 分别对 LHS 和 RHS 执行耗时评估
+  run_cost_analysis(lhs_module.get(), "LHS");
+  std::cerr << "-\n";
+  run_cost_analysis(rhs_module.get(), "RHS");
+  std::cerr << "-------------------------------------------\n";
+
   // 4. AOT 提前编译阶段 (消耗原始 Module)
   std::cerr << "Compiling LHS Executable...\n";
   auto compile_start = std::chrono::high_resolution_clock::now();
@@ -106,23 +168,23 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
   // 5. 随机测试主循环
   std::minstd_rand0 engine; 
   ErrorSpec error_spec(1e-3, 1e-3); // 默认误差阈值设置
-	double total_lhs_time = 0.0;
-	double total_rhs_time = 0.0;
+  double total_lhs_time = 0.0;
+  double total_rhs_time = 0.0;
 
   std::cerr << "\nStarting fuzzing loop for " << opts.iterations << " iterations...\n";
-  for (int i = 0; i < opts.iterations; ++i) {
-		ExecutionProfile lhs_profile, rhs_profile;
+  for (int i = 0; i < opts.iterations + 2; ++i) {
+    ExecutionProfile lhs_profile, rhs_profile;
     // 根据拷贝的 Module 生成随机张量
     TF_ASSIGN_OR_RETURN(std::vector<Literal> args,
                         MakeFakeArguments(signature_module.get(), &engine, 
                                           /*use_large_range=*/false, 
                                           /*treat_gte_as_data_formatting=*/false));
 
-		std::vector<const Literal*> arg_ptrs;
-		arg_ptrs.reserve(args.size());
-		for (const auto& arg : args) {
-			arg_ptrs.push_back(&arg);
-		}
+    std::vector<const Literal*> arg_ptrs;
+    arg_ptrs.reserve(args.size());
+    for (const auto& arg : args) {
+      arg_ptrs.push_back(&arg);
+    }
 
     // 执行并获取结果
     TF_ASSIGN_OR_RETURN(Literal lhs_result, runner.ExecuteWithExecutableAndProfile(lhs_exec.get(), arg_ptrs, &lhs_profile));
@@ -132,15 +194,20 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
     absl::Status comparison_status = literal_comparison::Near(
         lhs_result, rhs_result, error_spec, /*detailed_message=*/true, &OnMiscompare);
 
-		double lhs_time = static_cast<double>(lhs_profile.compute_time_ns()) / 1e6;
-		double rhs_time = static_cast<double>(rhs_profile.compute_time_ns()) / 1e6;
-		total_lhs_time += lhs_time;
-		total_rhs_time += rhs_time;
-		
-		std::cerr << "Iteration " << i + 1 << ": LHS execution time = " 
-							<< lhs_time << "ms, "
-							<< "RHS execution time = " 
-							<< rhs_time << "ms.\n";
+    if (i < 2) {
+      std::cerr << "Warm-up iteration " << i + 1 << " completed.\n";
+      continue; // 前两轮作为 warm-up，不计入时间统计和最终对比结果
+    }
+
+    double lhs_time = static_cast<double>(lhs_profile.compute_time_ns()) / 1e6;
+    double rhs_time = static_cast<double>(rhs_profile.compute_time_ns()) / 1e6;
+    total_lhs_time += lhs_time;
+    total_rhs_time += rhs_time;
+    
+    std::cerr << "Iteration " << i + 1 << ": LHS execution time = " 
+              << lhs_time << "ms, "
+              << "RHS execution time = " 
+              << rhs_time << "ms.\n";
 
     if (!comparison_status.ok()) {
       std::cerr << "Mismatch detected at iteration " << i + 1 << "!\n";
@@ -167,7 +234,7 @@ int main(int argc, char** argv) {
       tsl::Flag("iterations", &opts.iterations, "The number of times to run the module.")};
         
   const std::string kUsageString =
-      absl::StrCat(kUsage, "\n\n", tsl::Flags::Usage(argv[0], flag_list));
+      absl::StrCat(kUsage, "\n\n", tsl::Flags::Usage(argv[ 0 ], flag_list));
 
   bool parse_ok = tsl::Flags::Parse(&argc, argv, flag_list);
   if (!parse_ok) {
