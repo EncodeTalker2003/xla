@@ -145,19 +145,15 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
         /*replace_type_selector=*/replace_type_selector, 
         /*cross_computation=*/true);
 
-    // ==========================================
-    // 新增过滤逻辑：检查提取的图是否只包含 Parameter 和 Constant
-    // ==========================================
-    bool has_valid_ops = false;
+    int useful_op_count = 0;
     for (const HloInstruction* inst : extracted_module->entry_computation()->instructions()) {
       if (inst->opcode() != HloOpcode::kParameter && inst->opcode() != HloOpcode::kConstant) {
-        has_valid_ops = true;
-        break;
+        useful_op_count++;
       }
     }
     
     // 如果没有实质性的计算逻辑，直接丢弃该切片
-    if (!has_valid_ops) {
+    if (useful_op_count <= 0) {
       continue;
     }
 
@@ -167,6 +163,7 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
     xla::hlo_diff::HloGumgraphFingerprintOptions fp_options;
     fp_options.ignore_shape = false;
     fp_options.ignore_backend_config = true;
+		bool finding_duplicate = false;
 
     auto graph_or_status = xla::hlo_diff::HloGumgraph::Create(
         extracted_module.get(), fp_options, /*precompute_instruction_dependencies=*/false);
@@ -180,7 +177,7 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
       uint64_t fingerprint = graph->GetRoot().props.subgraph_fingerprint;
 
       if (seen_fingerprints.contains(fingerprint)) {
-        slice_index++;
+        //slice_index++;
         continue; // 发现重复图，跳过落盘
       }
       seen_fingerprints.insert(fingerprint);
