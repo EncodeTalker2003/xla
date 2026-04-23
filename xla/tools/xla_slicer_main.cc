@@ -4,6 +4,7 @@
 #include <vector>
 #include <queue>
 #include <fstream>
+#include <cstdlib> // 新增：为了使用 setenv 屏蔽底层日志
 
 #include "absl/log/check.h"
 #include "absl/status/status.h"
@@ -12,6 +13,7 @@
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/tools/hlo_diff/graph/hlo_gumgraph.h"
 #include "xla/service/hlo_verifier.h"
 #include "xla/tools/hlo_module_loader.h"
 #include "xla/tools/hlo_extractor.h" 
@@ -50,13 +52,11 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
           true));
   TF_RETURN_IF_ERROR(verifier.Run(module.get()).status());
   
-  // TODO: your logic goes here
-	// ==========================================
+  // ==========================================
   // 核心逻辑开始：基于深度和数量限制的自定义后向切片
   // ==========================================
 
   // 第一步：全局扫描，建立白名单子计算集合
-  // 将 kReduce, kReduceWindow, kMap, kSort 的内部计算函数加入白名单
   absl::flat_hash_set<const HloComputation*> whitelisted_comps;
   for (const HloComputation* comp : module->computations()) {
     for (const HloInstruction* inst : comp->instructions()) {
@@ -73,13 +73,14 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
 
   HloComputation* entry_comp = module->entry_computation();
   int slice_index = 0;
+  
+  // 初始化全局去重集合，用于记录已经切片出的子图 Fingerprint
+  absl::flat_hash_set<uint64_t> seen_fingerprints;
 
   // 第二步：遍历 main 函数中的每一条指令，作为切片的 ROOT
-	int inst_count_as_name = 0;
   for (HloInstruction* root_inst : entry_comp->instructions()) {
     
     // 初始化 BFS 队列和有效节点集合
-    // 队列中存储对：{指令指针, 当前深度}
     std::queue<std::pair<const HloInstruction*, int>> bfs_queue;
     absl::flat_hash_set<const HloInstruction*> valid_set;
 
@@ -91,13 +92,12 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
       auto [curr_inst, depth] = bfs_queue.front();
       bfs_queue.pop();
 
-      // 如果当前指令的深度已经达到 5，停止向其 operands 扩展
+      // 如果当前指令的深度已经达到配置值，停止向其 operands 扩展
       if (depth >= opts.depth) {
         continue;
       }
 
       for (const HloInstruction* operand : curr_inst->operands()) {
-        // 如果节点已被访问过，跳过
         if (valid_set.contains(operand)) {
           continue;
         }
@@ -106,20 +106,18 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
         if (operand->opcode() == HloOpcode::kWhile ||
             operand->opcode() == HloOpcode::kConditional ||
             operand->opcode() == HloOpcode::kCall) {
-          continue; // 不加入 valid_set，也不继续推入队列
+          continue; 
         }
 
-        // 如果指令总数已满 15，停止吸收新节点
+        // 如果指令总数已满，停止吸收新节点
         if (valid_set.size() >= opts.max_inst_count) {
           break; 
         }
 
-        // 验证通过，加入集合并推入下一层队列
         valid_set.insert(operand);
         bfs_queue.push({operand, depth + 1});
       }
       
-      // 再次检查，防止内部循环 break 后外层队列继续处理
       if (valid_set.size() >= opts.max_inst_count) {
         break;
       }
@@ -127,39 +125,72 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
 
     // 第四步：构造自定义的 Extract 拦截器并提取 Module
     auto extract_selector = [&](const HloInstruction* inst) -> bool {
-			if (inst->opcode() == HloOpcode::kConstant) {
+      if (inst->opcode() == HloOpcode::kConstant) {
         return true;
       }
-			
-      // 如果指令在主函数中，严格遵循 BFS 计算出的 valid_set
       if (inst->parent() == entry_comp) {
         return valid_set.contains(inst);
       }
-      // 如果指令在白名单运算的子图内部，无条件保留
       return whitelisted_comps.contains(inst->parent());
     };
 
     auto replace_type_selector = [](const HloInstruction* inst) {
-      // 任何未被选中的指令，直接原地替换为全 0
       return ReplaceType::kReplaceParam; 
     };
 
-    // 调用 XLA 底层的 ExtractModule
     auto extracted_module = ExtractModule(
         /*instruction=*/root_inst, 
-        /*height=*/-1, // 高度限制交由我们的 extract_selector 控制
+        /*height=*/-1, 
         /*extract_selector=*/extract_selector, 
         /*replace_type_selector=*/replace_type_selector, 
         /*cross_computation=*/true);
 
+    // ==========================================
+    // 新增过滤逻辑：检查提取的图是否只包含 Parameter 和 Constant
+    // ==========================================
+    bool has_valid_ops = false;
+    for (const HloInstruction* inst : extracted_module->entry_computation()->instructions()) {
+      if (inst->opcode() != HloOpcode::kParameter && inst->opcode() != HloOpcode::kConstant) {
+        has_valid_ops = true;
+        break;
+      }
+    }
+    
+    // 如果没有实质性的计算逻辑，直接丢弃该切片
+    if (!has_valid_ops) {
+      continue;
+    }
+
+    // ==========================================
+    // 利用 HloGumgraph 计算 Fingerprint 并进行去重
+    // ==========================================
+    xla::hlo_diff::HloGumgraphFingerprintOptions fp_options;
+    fp_options.ignore_shape = false;
+    fp_options.ignore_backend_config = true;
+
+    auto graph_or_status = xla::hlo_diff::HloGumgraph::Create(
+        extracted_module.get(), fp_options, /*precompute_instruction_dependencies=*/false);
+
+    if (!graph_or_status.ok()) {
+      std::cerr << "Warning: Failed to create Gumgraph for slice rooted at " 
+                << root_inst->name() << ". Skipping deduplication and saving directly. Error: " 
+                << graph_or_status.status() << std::endl;
+    } else {
+      std::unique_ptr<const xla::hlo_diff::HloGumgraph> graph = *std::move(graph_or_status);
+      uint64_t fingerprint = graph->GetRoot().props.subgraph_fingerprint;
+
+      if (seen_fingerprints.contains(fingerprint)) {
+        slice_index++;
+        continue; // 发现重复图，跳过落盘
+      }
+      seen_fingerprints.insert(fingerprint);
+    }
+
     // 第五步：将切片序列化并输出到独立文件中
-    // 文件名格式：{opts.name}_slice{slice_index}.hlo
     std::string output_filename = absl::StrCat(opts.name, "_slice_", slice_index, ".hlo");
-		// save the file to the output directory if specified
-		if (!opts.output_dir.empty()) {
-			// Ensure the output directory exists
-			tsl::Env::Default()->RecursivelyCreateDir(opts.output_dir);
-			output_filename = tsl::io::JoinPath(opts.output_dir, output_filename);
+    if (!opts.output_dir.empty()) {
+      tsl::Env::Default()->RecursivelyCreateDir(opts.output_dir);
+      output_filename = tsl::io::JoinPath(opts.output_dir, output_filename);
     }
 
     std::ofstream out_file(output_filename);
@@ -183,6 +214,7 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
 }  // namespace xla
 
 int main(int argc, char** argv) {
+
   xla::XlaSlicerConfig opts;
   std::vector<tsl::Flag> flag_list = {
       tsl::Flag("input_format", &opts.input_format,
@@ -192,27 +224,22 @@ int main(int argc, char** argv) {
                 "  pb : xla::HloProto in binary proto format\n"
                 "  pbtxt : xla::HloProto in text proto format\n"
                 "  stablehlo : StableHLO in textual or bytecode format"),
-			tsl::Flag("depth", &opts.depth, "The maximum depth for BFS traversal when slicing."),
-			tsl::Flag("max_inst_count", &opts.max_inst_count, "The maximum number of instructions to include in each slice."),
-			tsl::Flag("output_dir", &opts.output_dir, "The directory to save the sliced modules. Defaults to current directory."),
-		  tsl::Flag("name", &opts.name, "A name prefix for the output files. Defaults to 'default'.")};
-			
-  // The usage string includes the message at the top of the file and the flags
-  // defined above.
+      tsl::Flag("depth", &opts.depth, "The maximum depth for BFS traversal when slicing."),
+      tsl::Flag("max_inst_count", &opts.max_inst_count, "The maximum number of instructions to include in each slice."),
+      tsl::Flag("output_dir", &opts.output_dir, "The directory to save the sliced modules. Defaults to current directory."),
+      tsl::Flag("name", &opts.name, "A name prefix for the output files. Defaults to 'default'.")};
+      
   const std::string kUsageString =
-      absl::StrCat(kUsage, "\n\n", tsl::Flags::Usage(argv[0], flag_list));
+      absl::StrCat(kUsage, "\n\n", tsl::Flags::Usage(argv[ 0 ], flag_list));
 
   bool parse_ok = tsl::Flags::Parse(&argc, argv, flag_list);
   if (!parse_ok) {
-    // Print the usage using cerr to avoid truncation by LOG.
     std::cerr << kUsageString;
     return 1;
   }
   tsl::port::InitMain(kUsageString.c_str(), &argc, &argv);
 
-  /* QCHECK(argc == 4) << "Must specify a single input file. Number of args: "
-                    << argc; */
-  opts.input_file = argv[1];
+  opts.input_file = argv[ 1 ];
 
   absl::Status status = xla::RunXlaSlicer(opts);
   if (!status.ok()) {

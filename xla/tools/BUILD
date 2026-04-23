@@ -702,6 +702,7 @@ xla_cc_binary(
         ":hlo_slicer",     # 修复 xla_slicer_main.cc 包含 hlo_slicer.h
         ":hlo_module_loader",
         "//xla/hlo/ir:hlo", # 修复用到 HloComputation/HloInstruction 等
+        "//xla/hlo/tools/hlo_diff/graph:hlo_gumgraph", # 新增：用于图指纹提取与去重
         "//xla/service:hlo_verifier",
         "//xla/tsl/platform:errors", # 修复包含 errors.h
         "//xla/tsl/platform:statusor",
