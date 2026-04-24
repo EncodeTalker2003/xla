@@ -224,7 +224,7 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
     total_lhs_time += lhs_time;
     total_rhs_time += rhs_time;
     
-    std::cerr << "Iteration " << i + 1 << ": LHS execution time = " 
+    std::cerr << "Iteration " << i - 1 << ": LHS execution time = " 
               << lhs_time << "ms, "
               << "RHS execution time = " 
               << rhs_time << "ms.\n";

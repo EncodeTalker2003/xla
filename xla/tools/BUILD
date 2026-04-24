@@ -639,10 +639,17 @@ xla_cc_binary(
         "//xla/service:platform_util",
         
         # --- 新增：Cost Analysis 与硬件参数获取所需的依赖 ---
-        "//xla/service:compiler",
-        "//xla/service:hlo_cost_analysis",
+        "//xla/service:compiler", 
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:stream_executor_h",
+
+				# --- GPU Performance Model ---
+        "//xla/service/gpu/model:gpu_hlo_cost_analysis",
+        "//xla/service/gpu/model:gpu_performance_model",
+        "//xla/service/gpu/model:gpu_performance_model_base",
+        "//xla/service/gpu/model:fusion_analysis_cache",
+        "//xla/service/gpu:hlo_fusion_analysis",
+        "@llvm-project//mlir:IR",
         
         # 随机参数生成工具
         "//xla/tests:test_utils",
