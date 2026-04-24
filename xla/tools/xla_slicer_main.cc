@@ -153,7 +153,7 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
     }
     
     // 如果没有实质性的计算逻辑，直接丢弃该切片
-    if (useful_op_count <= 0) {
+    if (useful_op_count <= 1) {
       continue;
     }
 

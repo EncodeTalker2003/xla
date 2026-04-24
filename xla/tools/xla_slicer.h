@@ -14,7 +14,7 @@ struct XlaSlicerConfig {
   std::string input_file{""};
   std::string input_format{""};
 	int depth{5};
-	int max_inst_count{10};
+	int max_inst_count{12};
 	std::string output_dir{"./"};
 	std::string name{"default"};
   // Slicing depth, etc ...
