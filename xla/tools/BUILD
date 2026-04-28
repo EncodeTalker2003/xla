@@ -714,6 +714,8 @@ xla_cc_binary(
         "//xla/tsl/platform:errors", # 修复包含 errors.h
         "//xla/tsl/platform:statusor",
         "//xla/tsl/util:command_line_flags",
+        "//xla:shape_util",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set", # 修复主程序缺失的集合依赖
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/strings",

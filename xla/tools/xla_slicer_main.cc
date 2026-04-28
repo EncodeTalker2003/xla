@@ -9,6 +9,7 @@
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -18,6 +19,7 @@
 #include "xla/tools/hlo_module_loader.h"
 #include "xla/tools/hlo_extractor.h" 
 #include "xla/tools/hlo_slicer.h"
+#include "xla/shape_util.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/util/command_line_flags.h"
@@ -39,6 +41,17 @@ Usage:
 namespace xla {
 
 namespace {
+
+int64_t ComputeParameterElements(const HloModule* module) {
+  int64_t total = 0;
+  for (const HloInstruction* instr :
+       module->entry_computation()->instructions()) {
+    if (instr->opcode() == HloOpcode::kParameter) {
+      total += ShapeUtil::ElementsInRecursive(instr->shape());
+    }
+  }
+  return total;
+}
 
 absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
   std::string format = opts.input_format;
@@ -74,8 +87,10 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
   HloComputation* entry_comp = module->entry_computation();
   int slice_index = 0;
   
-  // 初始化全局去重集合，用于记录已经切片出的子图 Fingerprint
-  absl::flat_hash_set<uint64_t> seen_fingerprints;
+  // fingerprint → (best_module, best_total_param_elements)
+  absl::flat_hash_map<uint64_t,
+      std::pair<std::unique_ptr<HloModule>, int64_t>> best_slices;
+  std::vector<uint64_t> fingerprint_order;
 
   // 第二步：遍历 main 函数中的每一条指令，作为切片的 ROOT
   for (HloInstruction* root_inst : entry_comp->instructions()) {
@@ -161,49 +176,56 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
     // 利用 HloGumgraph 计算 Fingerprint 并进行去重
     // ==========================================
     xla::hlo_diff::HloGumgraphFingerprintOptions fp_options;
-    fp_options.ignore_shape = false;
+    fp_options.ignore_shape = true;
     fp_options.ignore_backend_config = true;
-		bool finding_duplicate = false;
 
     auto graph_or_status = xla::hlo_diff::HloGumgraph::Create(
         extracted_module.get(), fp_options, /*precompute_instruction_dependencies=*/false);
 
     if (!graph_or_status.ok()) {
-      std::cerr << "Warning: Failed to create Gumgraph for slice rooted at " 
-                << root_inst->name() << ". Skipping deduplication and saving directly. Error: " 
+      std::cerr << "Warning: Failed to create Gumgraph for slice rooted at "
+                << root_inst->name() << ". Skipping deduplication and saving directly. Error: "
                 << graph_or_status.status() << std::endl;
     } else {
       std::unique_ptr<const xla::hlo_diff::HloGumgraph> graph = *std::move(graph_or_status);
       uint64_t fingerprint = graph->GetRoot().props.subgraph_fingerprint;
+      int64_t param_elements = ComputeParameterElements(extracted_module.get());
 
-      if (seen_fingerprints.contains(fingerprint)) {
-        //slice_index++;
-        continue; // 发现重复图，跳过落盘
+      auto it = best_slices.find(fingerprint);
+      if (it == best_slices.end()) {
+        fingerprint_order.push_back(fingerprint);
+        best_slices.emplace(fingerprint,
+            std::make_pair(std::move(extracted_module), param_elements));
+      } else if (param_elements > it->second.second) {
+        it->second.first = std::move(extracted_module);
+        it->second.second = param_elements;
       }
-      seen_fingerprints.insert(fingerprint);
     }
+  }
 
-    // 第五步：将切片序列化并输出到独立文件中
-    std::string output_filename = absl::StrCat(opts.name, "_slice_", slice_index, ".hlo");
+  // 第五步：将每个指纹对应的最优切片序列化并输出到独立文件中
+  for (uint64_t fp : fingerprint_order) {
+    auto& [mod, param_elem_count] = best_slices[fp];
+    std::string output_filename =
+        absl::StrCat(opts.name, "_slice_", slice_index, ".hlo");
     if (!opts.output_dir.empty()) {
       tsl::Env::Default()->RecursivelyCreateDir(opts.output_dir);
       output_filename = tsl::io::JoinPath(opts.output_dir, output_filename);
     }
-
     std::ofstream out_file(output_filename);
     if (out_file.is_open()) {
       xla::HloPrintOptions print_options;
       print_options.set_print_metadata(false);
-      out_file << extracted_module->ToString(print_options);
+      out_file << mod->ToString(print_options);
       out_file.close();
-      std::cout << "Successfully saved slice to: " << output_filename << " (Instructions: " << valid_set.size() << ")" << std::endl;
+      std::cout << "Successfully saved slice to: " << output_filename
+                << " (ParameterElements: " << param_elem_count << ")" << std::endl;
     } else {
       std::cerr << "Failed to open file for writing: " << output_filename << std::endl;
     }
-
     slice_index++;
   }
-  
+
   return absl::OkStatus();
 }
 

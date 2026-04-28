@@ -228,11 +228,11 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
               << lhs_time << "ms, "
               << "RHS execution time = " 
               << rhs_time << "ms.\n";
-    /*
-    if (!comparison_status.ok() && ) {
+    
+    if (!comparison_status.ok()) {
       std::cerr << "Mismatch detected at iteration " << i + 1 << "!\n";
       return comparison_status;
-    }*/
+    }
   }
 
   std::cerr << "\nSuccess! LHS and RHS are equivalent across " << opts.iterations << " random inputs.\n";
