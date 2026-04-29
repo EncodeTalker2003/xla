@@ -681,6 +681,70 @@ xla_cc_binary(
 )
 
 cc_library(
+    name = "hlo_cse_lib",
+    srcs = ["hlo_cse.cc"],
+    hdrs = ["hlo_cse.h"],
+    deps = [
+        "//xla/hlo/ir:hlo",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+xla_cc_binary(
+    name = "hlo_cse",
+    testonly = True,
+    srcs = ["hlo_cse_main.cc"],
+    tags = [
+        "noasan",
+    ],
+    deps = [
+        ":hlo_cse_lib",
+        ":hlo_module_loader",
+
+        # Core data structures and comparison
+        "//xla:error_spec",
+        "//xla:literal",
+        "//xla:literal_comparison",
+        "//xla:shape_util",
+
+        # Runtime and platform
+        "//xla/service:hlo_runner",
+        "//xla/service:hlo_verifier",
+        "//xla/service:platform_util",
+
+        # Random argument generation
+        "//xla/tests:test_utils",
+
+        # Platform backend plugins
+        "//xla/service:cpu_plugin",
+        "//xla/service:interpreter_plugin",
+
+        # Error handling and CLI parsing
+        "//xla/tsl/platform:env",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
+        "//xla/tsl/util:command_line_flags",
+
+        # Base libraries
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@tsl//tsl/platform:fingerprint",
+        "@tsl//tsl/platform:path",
+        "@tsl//tsl/platform:platform_port",
+    ] + if_gpu_is_configured([
+        "//xla/service:gpu_plugin",
+    ]) + if_cuda([
+        "//xla/stream_executor:cuda_platform",
+    ]) + if_rocm([
+        "//xla/stream_executor:rocm_platform",
+    ]) + if_sycl_is_configured([
+        "//xla/stream_executor:sycl_platform",
+    ]),
+)
+
+cc_library(
     name = "xla_slicer_lib",
     srcs = ["xla_slicer.cc"],
     hdrs = ["xla_slicer.h"],
