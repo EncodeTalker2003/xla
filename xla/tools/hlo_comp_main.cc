@@ -188,54 +188,73 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
   std::cerr << "RHS compiled in " 
             << std::chrono::duration<double>(compile_end - compile_mid).count() << "s.\n";
 
-  // 5. 随机测试主循环
-  std::minstd_rand0 engine; 
-  ErrorSpec error_spec(1e-3, 1e-3); // 默认误差阈值设置
-  double total_lhs_time = 0.0;
-  double total_rhs_time = 0.0;
+  // 5. Generate all N+2 input sets upfront so LHS and RHS see identical inputs.
+  std::minstd_rand0 engine;
+  ErrorSpec error_spec(1e-3, 1e-3);
+  const int total_iters = opts.iterations + 2;  // 2 warm-up + N measured
 
-  std::cerr << "\nStarting fuzzing loop for " << opts.iterations << " iterations...\n";
-  for (int i = 0; i < opts.iterations + 2; ++i) {
-    ExecutionProfile lhs_profile, rhs_profile;
-    // 根据拷贝的 Module 生成随机张量
-    TF_ASSIGN_OR_RETURN(std::vector<Literal> args,
-                        MakeFakeArguments(signature_module.get(), &engine, 
-                                          /*use_large_range=*/false, 
+  std::cerr << "\nGenerating " << total_iters << " input sets...\n";
+  std::vector<std::vector<Literal>> all_args(total_iters);
+  for (int i = 0; i < total_iters; ++i) {
+    TF_ASSIGN_OR_RETURN(all_args[i],
+                        MakeFakeArguments(signature_module.get(), &engine,
+                                          /*use_large_range=*/false,
                                           /*treat_gte_as_data_formatting=*/false));
+  }
 
-    std::vector<const Literal*> arg_ptrs;
-    arg_ptrs.reserve(args.size());
-    for (const auto& arg : args) {
-      arg_ptrs.push_back(&arg);
-    }
+  // Helper: build a const-pointer span over one input set.
+  auto make_ptrs = [](const std::vector<Literal>& args) {
+    std::vector<const Literal*> ptrs;
+    ptrs.reserve(args.size());
+    for (const auto& a : args) ptrs.push_back(&a);
+    return ptrs;
+  };
 
-    // 执行并获取结果
-    TF_ASSIGN_OR_RETURN(Literal lhs_result, runner.ExecuteWithExecutableAndProfile(lhs_exec.get(), arg_ptrs, &lhs_profile));
-    TF_ASSIGN_OR_RETURN(Literal rhs_result, runner.ExecuteWithExecutableAndProfile(rhs_exec.get(), arg_ptrs, &rhs_profile));
-
-    // 对比容差
-    absl::Status comparison_status = literal_comparison::Near(
-        lhs_result, rhs_result, error_spec, /*detailed_message=*/true, &OnMiscompare);
-
+  // 6. LHS block: warm-up then N measured runs.
+  std::cerr << "\nRunning LHS block...\n";
+  std::vector<Literal> lhs_results(opts.iterations);
+  std::vector<double>  lhs_times(opts.iterations);
+  for (int i = 0; i < total_iters; ++i) {
+    ExecutionProfile profile;
+    auto ptrs = make_ptrs(all_args[i]);
+    TF_ASSIGN_OR_RETURN(Literal result,
+                        runner.ExecuteWithExecutableAndProfile(lhs_exec.get(), ptrs, &profile));
     if (i < 2) {
-      std::cerr << "Warm-up iteration " << i + 1 << " completed.\n";
-      continue; // 前两轮作为 warm-up，不计入时间统计和最终对比结果
+      std::cerr << "LHS warm-up iteration " << i + 1 << " completed.\n";
+      continue;
     }
+    lhs_results[i - 2] = std::move(result);
+    lhs_times[i - 2] = static_cast<double>(profile.compute_time_ns()) / 1e6;
+		std::cerr << "LHS iteration " << i - 1 << " completed in " << lhs_times[i - 2] << "ms.\n";
+  }
 
-    double lhs_time = static_cast<double>(lhs_profile.compute_time_ns()) / 1e6;
-    double rhs_time = static_cast<double>(rhs_profile.compute_time_ns()) / 1e6;
-    total_lhs_time += lhs_time;
-    total_rhs_time += rhs_time;
-    
-    std::cerr << "Iteration " << i - 1 << ": LHS execution time = " 
-              << lhs_time << "ms, "
-              << "RHS execution time = " 
-              << rhs_time << "ms.\n";
-    
-    if (!comparison_status.ok()) {
-      std::cerr << "Mismatch detected at iteration " << i + 1 << "!\n";
-      return comparison_status;
+  // 7. RHS block: warm-up then N measured runs; compare on-the-fly with stored LHS results.
+  std::cerr << "\nRunning RHS block...\n";
+  std::vector<double> rhs_times(opts.iterations);
+  for (int i = 0; i < total_iters; ++i) {
+    ExecutionProfile profile;
+    auto ptrs = make_ptrs(all_args[i]);
+    TF_ASSIGN_OR_RETURN(Literal rhs_result,
+                        runner.ExecuteWithExecutableAndProfile(rhs_exec.get(), ptrs, &profile));
+    if (i < 2) {
+      std::cerr << "RHS warm-up iteration " << i + 1 << " completed.\n";
+      continue;
     }
+    rhs_times[i - 2] = static_cast<double>(profile.compute_time_ns()) / 1e6;
+    absl::Status cmp = literal_comparison::Near(
+        lhs_results[i - 2], rhs_result, error_spec, /*detailed_message=*/true, &OnMiscompare);
+    if (!cmp.ok()) {
+      std::cerr << "Mismatch detected at iteration " << i - 1 << "!\n";
+      return cmp;
+    }
+		std::cerr << "RHS iteration " << i - 1 << " completed in " << rhs_times[i - 2] << "ms.\n";
+  }
+
+  // 8. Report per-iteration times and summary.
+  double total_lhs_time = 0.0, total_rhs_time = 0.0;
+  for (int i = 0; i < opts.iterations; ++i) {
+    total_lhs_time += lhs_times[i];
+    total_rhs_time += rhs_times[i];
   }
 
   std::cerr << "\nSuccess! LHS and RHS are equivalent across " << opts.iterations << " random inputs.\n";
