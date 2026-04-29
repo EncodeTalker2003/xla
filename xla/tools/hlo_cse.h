@@ -11,7 +11,8 @@ struct HloCseConfig {
   std::string input_format{""};
   std::string platform{"CUDA"};
   int iterations{5};        // random test iterations per candidate
-  int max_cse_rounds{10};  // max outer substitution rounds
+  int max_cse_rounds{10};   // max outer substitution rounds
+  int max_peel_rounds{5};  // max top-level operator peeling rounds
   std::string output_dir{""};
 };
 

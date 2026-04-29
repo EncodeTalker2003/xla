@@ -106,6 +106,7 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
   auto run_cost_analysis = [&](const HloModule* module, const std::string& name) {
     std::cerr << "Running HLO Passes for " << name << " Cost Analysis...\n";
     std::unique_ptr<HloModule> cost_module = module->Clone();
+    cost_module->mutable_config().mutable_debug_options().add_xla_disable_hlo_passes("algsimp");
     xla::Compiler::CompileOptions compile_options;
     auto pass_status = compiler->RunHloPasses(std::move(cost_module), executor, compile_options);
 
@@ -172,6 +173,7 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
   // 4. AOT 提前编译阶段 (消耗原始 Module)
   std::cerr << "Compiling LHS Executable...\n";
   auto compile_start = std::chrono::high_resolution_clock::now();
+  lhs_module->mutable_config().mutable_debug_options().add_xla_disable_hlo_passes("algsimp");
   TF_ASSIGN_OR_RETURN(std::unique_ptr<OpaqueExecutable> lhs_exec,
                       runner.CreateExecutable(std::move(lhs_module), /*run_hlo_passes=*/true));
   auto compile_mid = std::chrono::high_resolution_clock::now();
@@ -179,6 +181,7 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
             << std::chrono::duration<double>(compile_mid - compile_start).count() << "s.\n";
 
   std::cerr << "Compiling RHS Executable...\n";
+  rhs_module->mutable_config().mutable_debug_options().add_xla_disable_hlo_passes("algsimp");
   TF_ASSIGN_OR_RETURN(std::unique_ptr<OpaqueExecutable> rhs_exec,
                       runner.CreateExecutable(std::move(rhs_module), /*run_hlo_passes=*/true));
   auto compile_end = std::chrono::high_resolution_clock::now();

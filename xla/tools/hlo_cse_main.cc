@@ -262,6 +262,91 @@ absl::Status RemoveDeadParamsSynchronized(HloComputation* lhs_entry,
   return absl::OkStatus();
 }
 
+// Attempt one round of top-level operator peeling.
+//
+// If the roots of lhs and rhs share the same opcode and all operands match
+// structurally except for exactly one (with the same shape), we peel by
+// replacing the root with that differing operand and running an equivalence
+// test.  Only commits if the test passes (rejecting non-injective ops like
+// mul/abs where peeling may change semantics).
+//
+// Returns true if a peel was committed.
+absl::StatusOr<bool> TryTopLevelPeel(
+    std::unique_ptr<HloModule>& current_lhs,
+    std::unique_ptr<HloModule>& current_rhs,
+    const HloCseConfig& opts,
+    HloRunner& runner) {
+  auto test_lhs = current_lhs->Clone();
+  auto test_rhs = current_rhs->Clone();
+
+  HloInstruction* lhs_root =
+      test_lhs->entry_computation()->root_instruction();
+  HloInstruction* rhs_root =
+      test_rhs->entry_computation()->root_instruction();
+
+  // Guard 1: roots must share the same opcode.
+  if (lhs_root->opcode() != rhs_root->opcode()) return false;
+
+  // Guard 2: must have the same number of operands (and at least one).
+  if (lhs_root->operand_count() != rhs_root->operand_count()) return false;
+  if (lhs_root->operand_count() == 0) return false;
+
+  // Guard 3: exactly one operand index must differ (by subgraph fingerprint).
+  int diff_idx = -1;
+  {
+    absl::flat_hash_map<const HloInstruction*, uint64_t> lhs_fp_cache;
+    absl::flat_hash_map<const HloInstruction*, uint64_t> rhs_fp_cache;
+    int diff_count = 0;
+    for (int i = 0; i < static_cast<int>(lhs_root->operand_count()); ++i) {
+      uint64_t lhs_fp = SubgraphFp(lhs_root->operand(i), lhs_fp_cache);
+      uint64_t rhs_fp = SubgraphFp(rhs_root->operand(i), rhs_fp_cache);
+      if (lhs_fp != rhs_fp) {
+        ++diff_count;
+        diff_idx = i;
+      }
+    }
+    if (diff_count != 1) return false;
+  }
+	std::cerr << "  Attempting peel of opcode " << HloOpcodeString(lhs_root->opcode())
+						<< " on operand index " << diff_idx << "...\n";
+
+  HloInstruction* lhs_new = lhs_root->mutable_operand(diff_idx);
+  HloInstruction* rhs_new = rhs_root->mutable_operand(diff_idx);
+
+  // Guard 4: the two differing operands must have the same shape.
+  if (!ShapeUtil::Equal(lhs_new->shape(), rhs_new->shape())) return false;
+
+  // Capture opcode before cleanup invalidates lhs_root pointer.
+  HloOpcode peeled_opcode = lhs_root->opcode();
+
+  // Apply: promote the differing operand to root.
+  test_lhs->entry_computation()->set_root_instruction(
+      lhs_new, /*accept_different_shape=*/true);
+  test_rhs->entry_computation()->set_root_instruction(
+      rhs_new, /*accept_different_shape=*/true);
+
+  // Remove the now-dead old root and any other dead instructions/parameters.
+  TF_RETURN_IF_ERROR(RemoveDeadInstructions(test_lhs->entry_computation()));
+  TF_RETURN_IF_ERROR(RemoveDeadInstructions(test_rhs->entry_computation()));
+  TF_RETURN_IF_ERROR(RemoveDeadParamsSynchronized(
+      test_lhs->entry_computation(), test_rhs->entry_computation()));
+
+  // Equivalence test on the peeled modules.
+  absl::Status test_status = TestEquivalence(
+      test_lhs.get(), test_rhs.get(), test_lhs.get(), opts, runner);
+
+  if (test_status.ok()) {
+    std::cerr << "  Top-level peel ACCEPTED (opcode="
+              << HloOpcodeString(peeled_opcode)
+              << " diff_operand=" << diff_idx << ").\n";
+    current_lhs = std::move(test_lhs);
+    current_rhs = std::move(test_rhs);
+    return true;
+  }
+  std::cerr << "  Top-level peel REJECTED: " << test_status.message() << "\n";
+  return false;
+}
+
 absl::Status RunHloCse(const HloCseConfig& opts) {
   // ---- Phase 1: Load, Verify, Signature Check ----
   std::string format = opts.input_format;
@@ -404,6 +489,17 @@ absl::Status RunHloCse(const HloCseConfig& opts) {
       current_lhs->entry_computation(),
       current_rhs->entry_computation()));
 
+  // ---- Phase 4.5: Top-Level Operator Peeling ----
+  std::cerr << "\nStarting top-level operator peeling...\n";
+  int peel_count = 0;
+  for (int peel_round = 0; peel_round < opts.max_peel_rounds; ++peel_round) {
+    TF_ASSIGN_OR_RETURN(bool peeled,
+        TryTopLevelPeel(current_lhs, current_rhs, opts, runner));
+    if (!peeled) break;
+    ++peel_count;
+  }
+  std::cerr << "Total top-level peels performed: " << peel_count << "\n";
+
   // ---- Phase 5: Output ----
   if (opts.output_dir.empty()) {
     return absl::InvalidArgumentError("--output_dir must be specified.");
@@ -471,6 +567,8 @@ int main(int argc, char** argv) {
                 "Random test iterations per CSE candidate."),
       tsl::Flag("max_cse_rounds", &opts.max_cse_rounds,
                 "Maximum number of outer CSE substitution rounds."),
+      tsl::Flag("max_peel_rounds", &opts.max_peel_rounds,
+                "Maximum number of top-level operator peeling rounds."),
       tsl::Flag("output_dir", &opts.output_dir,
                 "Directory to write the output HLO files."),
   };
