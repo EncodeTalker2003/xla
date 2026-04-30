@@ -16,6 +16,7 @@ struct HloCompConfig {
   std::string input_format{""};
   std::string platform;
   int iterations{1};
+  std::string dump_dir{""};
 };
 
 }  // namespace xla

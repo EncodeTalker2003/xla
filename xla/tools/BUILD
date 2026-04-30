@@ -644,6 +644,7 @@ xla_cc_binary(
         "//xla/stream_executor:stream_executor_h",
 
 				# --- GPU Performance Model ---
+        "//xla/service/gpu:cublas_cudnn",
         "//xla/service/gpu/model:gpu_hlo_cost_analysis",
         "//xla/service/gpu/model:gpu_performance_model",
         "//xla/service/gpu/model:gpu_performance_model_base",
