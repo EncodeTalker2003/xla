@@ -11,9 +11,12 @@
 #include "absl/strings/str_cat.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/literal.h"
 #include "xla/hlo/tools/hlo_diff/graph/hlo_gumgraph.h"
 #include "xla/service/hlo_verifier.h"
 #include "xla/tools/hlo_module_loader.h"
@@ -175,12 +178,46 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
     // ==========================================
     // 利用 HloGumgraph 计算 Fingerprint 并进行去重
     // ==========================================
+
+    // Clone the extracted module for fingerprinting only; the original is
+    // preserved for output with its actual (non-normalized) slice indices.
+    auto fp_module = extracted_module->Clone("fp");
+
+    // Normalize kSlice start indices to 0 in the entry computation.
+    // This makes slices that differ only in their starting offset
+    // (e.g., [0:1] vs [1:2]) hash to the same fingerprint.
+    // Whitelisted sub-computations are guaranteed to contain no kSlice.
+    for (HloInstruction* inst :
+         fp_module->entry_computation()->instructions()) {
+      if (inst->opcode() == HloOpcode::kSlice) {
+        auto* slice = Cast<HloSliceInstruction>(inst);
+        auto* starts = slice->mutable_slice_starts();
+        auto* limits = slice->mutable_slice_limits();
+        for (int i = 0; i < static_cast<int>(starts->size()); ++i) {
+          (*limits)[i] -= (*starts)[i];
+          (*starts)[i] = 0;
+        }
+      }
+    }
+
+    // Normalize constant values to zero across all computations.
+    // Programs differing only in constant values (e.g., constant(0.340488)
+    // vs constant(-0.494451523)) will hash to the same fingerprint.
+    for (HloComputation* comp : fp_module->computations()) {
+      for (HloInstruction* inst : comp->instructions()) {
+        if (inst->opcode() == HloOpcode::kConstant) {
+          *Cast<HloConstantInstruction>(inst)->mutable_literal() =
+              Literal::CreateFromShape(inst->shape());
+        }
+      }
+    }
+
     xla::hlo_diff::HloGumgraphFingerprintOptions fp_options;
     fp_options.ignore_shape = true;
     fp_options.ignore_backend_config = true;
 
     auto graph_or_status = xla::hlo_diff::HloGumgraph::Create(
-        extracted_module.get(), fp_options, /*precompute_instruction_dependencies=*/false);
+        fp_module.get(), fp_options, /*precompute_instruction_dependencies=*/false);
 
     if (!graph_or_status.ok()) {
       std::cerr << "Warning: Failed to create Gumgraph for slice rooted at "
