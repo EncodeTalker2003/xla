@@ -24,7 +24,9 @@
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tests/test_utils.h"
 #include "mlir/IR/MLIRContext.h"
+#include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/cublas_cudnn.h"
+#include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/gpu/model/gpu_hlo_cost_analysis.h"
 #include "xla/service/gpu/model/gpu_performance_model.h"
 #include "xla/service/gpu/model/gpu_performance_model_base.h"
@@ -53,7 +55,52 @@ Usage:
 namespace xla {
 namespace {
 
-// 简化版的比对失败回调，直接打印维度和概要信息
+// ── Conclusion types ──────────────────────────────────────────────────────────
+
+enum class HloCompConclusion {
+  kGrammarError,  // LHS or RHS failed to load / verify
+  kRuntimeError,  // LHS or RHS failed to compile or execute
+  kNotEquivalent, // outputs differ, or incompatible signatures
+  kRhsNotBetter,  // equivalent but RHS is not more profitable
+  kRhsBetter,     // equivalent and RHS is more profitable
+};
+
+// Prints the final conclusion to stdout.
+// `side` should be "LHS" or "RHS" for kGrammarError and kRuntimeError.
+// `error_detail` is appended to the conclusion line for those two kinds so
+// callers can extract both the category and the raw error in one line.
+void PrintConclusion(HloCompConclusion conclusion,
+                     std::string_view side = "",
+                     std::string_view error_detail = "") {
+  auto append_detail = [&]() {
+    if (!error_detail.empty()) std::cout << ": " << error_detail;
+  };
+  switch (conclusion) {
+    case HloCompConclusion::kGrammarError:
+      std::cout << "CONCLUSION: " << side << " has grammar issues";
+      append_detail();
+      std::cout << "\n";
+      break;
+    case HloCompConclusion::kRuntimeError:
+      std::cout << "CONCLUSION: " << side << " has runtime errors";
+      append_detail();
+      std::cout << "\n";
+      break;
+    case HloCompConclusion::kNotEquivalent:
+      std::cout << "CONCLUSION: LHS and RHS are not equivalent\n";
+      break;
+    case HloCompConclusion::kRhsNotBetter:
+      std::cout << "CONCLUSION: RHS is not more profitable than LHS\n";
+      break;
+    case HloCompConclusion::kRhsBetter:
+      std::cout << "CONCLUSION: RHS is more profitable than LHS\n";
+      break;
+  }
+  std::cout.flush();
+}
+
+// ── Data types ────────────────────────────────────────────────────────────────
+
 void OnMiscompare(const LiteralSlice& expected, const LiteralSlice& actual,
                   const LiteralSlice& mismatches,
                   const ShapeIndex& /*shape_index*/,
@@ -71,10 +118,74 @@ struct CostMetrics {
   int64_t total_hbm_bytes{0};
 };
 
-// Prints a unified comparison table of static and real-execution metrics, then
-// emits a verdict using the priority order:
-//   1. kernel count  2. total FLOPs  3. real exec time (>5%)
-//   4. static exec time (>5%)  5. instruction count
+// ── Verdict determination ─────────────────────────────────────────────────────
+
+// Determines whether RHS is more profitable than LHS using a priority-order
+// comparison. When static metrics are unavailable, falls back to real exec time
+// only (>5% threshold required for kRhsBetter).
+HloCompConclusion DetermineVerdict(const std::optional<CostMetrics>& lhs_opt,
+                                   const std::optional<CostMetrics>& rhs_opt,
+                                   double avg_lhs_ms, double avg_rhs_ms) {
+  constexpr double kThreshold = 0.05;
+
+  if (lhs_opt && rhs_opt) {
+    const CostMetrics& lm = *lhs_opt;
+    const CostMetrics& rm = *rhs_opt;
+    double lhs_static_ms = absl::ToDoubleMilliseconds(lm.total_exec_time);
+    double rhs_static_ms = absl::ToDoubleMilliseconds(rm.total_exec_time);
+    double lhbm = static_cast<double>(lm.total_hbm_bytes);
+    double rhbm = static_cast<double>(rm.total_hbm_bytes);
+
+    
+
+		if (rhs_static_ms < lhs_static_ms * 0.96 || rhs_static_ms < lhs_static_ms - 0.01) {
+			return HloCompConclusion::kRhsBetter;
+		} else if (lhs_static_ms < rhs_static_ms * 0.96 || lhs_static_ms < rhs_static_ms - 0.01) {
+			return HloCompConclusion::kRhsNotBetter;
+		} else if (rm.instruction_count < lm.instruction_count) {
+			return HloCompConclusion::kRhsBetter;
+		} else {
+			return HloCompConclusion::kRhsNotBetter;
+		}
+	}
+    
+		/*
+		// Priority order: FLOPs → HBM → kernel count → real time → static time →
+    // instruction count.
+    if (lm.total_flops != rm.total_flops)
+      return (rm.total_flops < lm.total_flops) ? HloCompConclusion::kRhsBetter
+                                               : HloCompConclusion::kRhsNotBetter;
+    if (rhbm < lhbm * (1.0 - kThreshold))
+      return HloCompConclusion::kRhsBetter;
+    if (lhbm < rhbm * (1.0 - kThreshold))
+      return HloCompConclusion::kRhsNotBetter;
+    if (lm.kernel_count != rm.kernel_count)
+      return (rm.kernel_count < lm.kernel_count) ? HloCompConclusion::kRhsBetter
+                                                 : HloCompConclusion::kRhsNotBetter;
+    if (avg_rhs_ms < avg_lhs_ms * (1.0 - kThreshold))
+      return HloCompConclusion::kRhsBetter;
+    if (avg_lhs_ms < avg_rhs_ms * (1.0 - kThreshold))
+      return HloCompConclusion::kRhsNotBetter;
+    if (rhs_static_ms < lhs_static_ms * (1.0 - kThreshold))
+      return HloCompConclusion::kRhsBetter;
+    if (lhs_static_ms < rhs_static_ms * (1.0 - kThreshold))
+      return HloCompConclusion::kRhsNotBetter;
+    if (lm.instruction_count != rm.instruction_count)
+      return (rm.instruction_count < lm.instruction_count)
+                 ? HloCompConclusion::kRhsBetter
+                 : HloCompConclusion::kRhsNotBetter;
+    return HloCompConclusion::kRhsNotBetter;  // all metrics tied
+  }
+		*/
+
+  // Static metrics unavailable — fall back to real exec time only.
+  if (avg_rhs_ms < avg_lhs_ms * 0.98 || avg_rhs_ms < avg_lhs_ms - 0.01)
+    return HloCompConclusion::kRhsBetter;
+  return HloCompConclusion::kRhsNotBetter;
+}
+
+// ── Comparison table (pure printer, no verdict) ───────────────────────────────
+
 void PrintComparisonTable(const std::optional<CostMetrics>& lhs_opt,
                           const std::optional<CostMetrics>& rhs_opt,
                           double avg_lhs_ms, double avg_rhs_ms) {
@@ -99,7 +210,6 @@ void PrintComparisonTable(const std::optional<CostMetrics>& lhs_opt,
             << "Winner\n"
             << std::string(62, '-') << "\n";
 
-  // Static rows.
   if (lhs_opt && rhs_opt) {
     const CostMetrics& lm = *lhs_opt;
     const CostMetrics& rm = *rhs_opt;
@@ -117,7 +227,7 @@ void PrintComparisonTable(const std::optional<CostMetrics>& lhs_opt,
               << std::setw(16) << rhbm_mb
               << ratio_winner(lhbm_mb, rhbm_mb) << "\n"
               << std::defaultfloat
-							<< std::setw(24) << "Kernel count"
+              << std::setw(24) << "Kernel count"
               << std::setw(16) << lm.kernel_count
               << std::setw(16) << rm.kernel_count
               << winner_str(lm.kernel_count, rm.kernel_count) << "\n"
@@ -141,140 +251,130 @@ void PrintComparisonTable(const std::optional<CostMetrics>& lhs_opt,
               << std::setw(24) << "Instruction count"
               << std::setw(16) << "N/A" << std::setw(16) << "N/A" << "N/A\n";
   }
-  // Real execution time row.
   std::cerr << std::setw(24) << "Real exec time (ms)"
             << std::setw(16) << avg_lhs_ms
             << std::setw(16) << avg_rhs_ms
             << ratio_winner(avg_lhs_ms, avg_rhs_ms) << "\n"
-            << std::string(62, '-') << "\n\n";
-
-  // Priority-order verdict.
-  int verdict = 0;  // -1 = RHS better, +1 = LHS better, 0 = inconclusive
-  const char* decided_by = "";
-
-  if (lhs_opt && rhs_opt) {
-    const CostMetrics& lm = *lhs_opt;
-    const CostMetrics& rm = *rhs_opt;
-    double lhs_static_ms = absl::ToDoubleMilliseconds(lm.total_exec_time);
-    double rhs_static_ms = absl::ToDoubleMilliseconds(rm.total_exec_time);
-
-    double lhbm = static_cast<double>(lm.total_hbm_bytes);
-    double rhbm = static_cast<double>(rm.total_hbm_bytes);
-    if (lm.total_flops != rm.total_flops) {
-      verdict = (lm.total_flops < rm.total_flops) ? 1 : -1;
-      decided_by = "total FLOPs";
-    } else if (rhbm < lhbm * (1.0 - kThreshold)) {
-      verdict = -1; decided_by = "HBM traffic";
-    } else if (lhbm < rhbm * (1.0 - kThreshold)) {
-      verdict = 1; decided_by = "HBM traffic";
-    } else if (lm.kernel_count != rm.kernel_count) {
-      verdict = (lm.kernel_count < rm.kernel_count) ? 1 : -1;
-      decided_by = "kernel count";
-    } else if (avg_rhs_ms < avg_lhs_ms * (1.0 - kThreshold)) {
-      verdict = -1; decided_by = "real exec time";
-    } else if (avg_lhs_ms < avg_rhs_ms * (1.0 - kThreshold)) {
-      verdict = 1; decided_by = "real exec time";
-    } else if (rhs_static_ms < lhs_static_ms * (1.0 - kThreshold)) {
-      verdict = -1; decided_by = "static exec time";
-    } else if (lhs_static_ms < rhs_static_ms * (1.0 - kThreshold)) {
-      verdict = 1; decided_by = "static exec time";
-    } else if (lm.instruction_count != rm.instruction_count) {
-      verdict = (lm.instruction_count < rm.instruction_count) ? 1 : -1;
-      decided_by = "instruction count";
-    }
-  } else {
-    // Static metrics unavailable — fall back to real exec time only.
-    if (avg_rhs_ms < avg_lhs_ms * (1.0 - kThreshold)) {
-      verdict = -1; decided_by = "real exec time";
-    } else if (avg_lhs_ms < avg_rhs_ms * (1.0 - kThreshold)) {
-      verdict = 1; decided_by = "real exec time";
-    }
-  }
-
-  if (verdict < 0) {
-    std::cerr << "→ RHS is likely better  [decided by: " << decided_by << "]\n";
-  } else if (verdict > 0) {
-    std::cerr << "→ LHS is likely better  [decided by: " << decided_by << "]\n";
-  } else {
-    std::cerr << "→ Inconclusive (all metrics within threshold)\n";
-  }
+            << std::string(62, '-') << "\n";
   std::cerr << "Note: HLO-level metrics may underestimate benefits of "
                "backend-fusion restructuring.\n";
 }
+
+// ── Main comparison logic ─────────────────────────────────────────────────────
 
 absl::Status RunHloComp(const HloCompConfig& opts) {
   std::string format = opts.input_format;
   if (format.empty()) {
     format = std::string(tsl::io::Extension(opts.lhs_file));
   }
-  
+
+  // ── Phase 1: Load and verify LHS ─────────────────────────────────────────
   std::cerr << "Loading LHS module...\n";
-  TF_ASSIGN_OR_RETURN(auto lhs_module, LoadModuleFromFile(opts.lhs_file, format));
+  auto lhs_module_or = LoadModuleFromFile(opts.lhs_file, format);
+  if (!lhs_module_or.ok()) {
+    std::cerr << "Grammar error (LHS): " << lhs_module_or.status().message() << "\n";
+    PrintConclusion(HloCompConclusion::kGrammarError, "LHS",
+                    lhs_module_or.status().message());
+    return lhs_module_or.status();
+  }
+  std::unique_ptr<HloModule> lhs_module = std::move(lhs_module_or).value();
+
   HloVerifier verifier(
       HloVerifierOpts{}.WithLayoutSensitive(false).WithAllowMixedPrecision(true));
-  TF_RETURN_IF_ERROR(verifier.Run(lhs_module.get()).status());
+  auto lhs_verify = verifier.Run(lhs_module.get());
+  if (!lhs_verify.ok()) {
+    std::cerr << "Grammar error (LHS): " << lhs_verify.status().message() << "\n";
+    PrintConclusion(HloCompConclusion::kGrammarError, "LHS",
+                    lhs_verify.status().message());
+    return lhs_verify.status();
+  }
 
+  // ── Phase 1b: Load and verify RHS ────────────────────────────────────────
   std::cerr << "Loading RHS module...\n";
-  TF_ASSIGN_OR_RETURN(auto rhs_module, LoadModuleFromFile(opts.rhs_file, format));
-  TF_RETURN_IF_ERROR(verifier.Run(rhs_module.get()).status());
+  auto rhs_module_or = LoadModuleFromFile(opts.rhs_file, format);
+  if (!rhs_module_or.ok()) {
+    std::cerr << "Grammar error (RHS): " << rhs_module_or.status().message() << "\n";
+    PrintConclusion(HloCompConclusion::kGrammarError, "RHS",
+                    rhs_module_or.status().message());
+    return rhs_module_or.status();
+  }
+  std::unique_ptr<HloModule> rhs_module = std::move(rhs_module_or).value();
 
-  // 1. 签名一致性静态检查
+  auto rhs_verify = verifier.Run(rhs_module.get());
+  if (!rhs_verify.ok()) {
+    std::cerr << "Grammar error (RHS): " << rhs_verify.status().message() << "\n";
+    PrintConclusion(HloCompConclusion::kGrammarError, "RHS",
+                    rhs_verify.status().message());
+    return rhs_verify.status();
+  }
+
+  // ── Phase 2: Signature check ──────────────────────────────────────────────
   const auto* lhs_entry = lhs_module->entry_computation();
   const auto* rhs_entry = rhs_module->entry_computation();
   if (lhs_entry->num_parameters() != rhs_entry->num_parameters()) {
-    return absl::InvalidArgumentError("LHS and RHS entry computations have a different number of parameters.");
+    PrintConclusion(HloCompConclusion::kNotEquivalent);
+    return absl::InvalidArgumentError(
+        "LHS and RHS entry computations have a different number of parameters.");
   }
   for (int i = 0; i < lhs_entry->num_parameters(); ++i) {
     if (!ShapeUtil::Equal(lhs_entry->parameter_instruction(i)->shape(),
                           rhs_entry->parameter_instruction(i)->shape())) {
-      return absl::InvalidArgumentError("LHS and RHS entry computation parameter shapes do not match.");
+      PrintConclusion(HloCompConclusion::kNotEquivalent);
+      return absl::InvalidArgumentError(
+          "LHS and RHS entry computation parameter shapes do not match.");
     }
   }
 
-  // 2. 深拷贝以保留签名信息用于随机数据生成
+  // Preserve signature for random-input generation (phases 5–6 consume the
+  // original modules).
   std::unique_ptr<HloModule> signature_module = lhs_module->Clone();
 
-  // 3. 平台与 Runner 初始化
-  TF_ASSIGN_OR_RETURN(se::Platform* platform, PlatformUtil::GetPlatform(opts.platform));
+  // ── Phase 3: Platform and runner init ────────────────────────────────────
+  TF_ASSIGN_OR_RETURN(se::Platform* platform,
+                      PlatformUtil::GetPlatform(opts.platform));
   HloRunner runner(platform);
-
-  // --- 插入阶段：Cost Model 分析与耗时预估 ---
   TF_ASSIGN_OR_RETURN(auto compiler, xla::Compiler::GetForPlatform(platform));
-  TF_ASSIGN_OR_RETURN(se::StreamExecutor* executor, platform->ExecutorForDevice(0));
+  TF_ASSIGN_OR_RETURN(se::StreamExecutor* executor,
+                      platform->ExecutorForDevice(0));
 
   // MLIRContext must outlive all GpuPerformanceModelOwning instances.
   mlir::MLIRContext mlir_ctx;
 
-  // Lambda to run HLO passes + cost analysis; returns nullopt on failure.
-  auto run_cost_analysis = [&](const HloModule* module, const std::string& name) -> std::optional<CostMetrics> {
+  // ── Phase 3: Cost analysis (soft failure — nullopt continues) ────────────
+  auto run_cost_analysis = [&](const HloModule* module,
+                               const std::string& name)
+      -> std::optional<CostMetrics> {
     std::cerr << "Running HLO Passes for " << name << " Cost Analysis...\n";
     std::unique_ptr<HloModule> cost_module = module->Clone();
-    cost_module->mutable_config().mutable_debug_options().add_xla_disable_hlo_passes("algsimp");
+    cost_module->mutable_config()
+        .mutable_debug_options()
+        .add_xla_disable_hlo_passes("algsimp");
     xla::Compiler::CompileOptions compile_options;
-    auto pass_status = compiler->RunHloPasses(std::move(cost_module), executor, compile_options);
-
+    auto pass_status = compiler->RunHloPasses(std::move(cost_module), executor,
+                                              compile_options);
     if (!pass_status.ok()) {
-      std::cerr << "Warning: Failed to run HLO passes for " << name << " cost analysis.\n";
+      std::cerr << "Warning: Failed to run HLO passes for " << name
+                << " cost analysis.\n";
       return std::nullopt;
     }
-
     std::unique_ptr<HloModule> optimized_module = std::move(pass_status).value();
 
     if (!opts.dump_dir.empty()) {
-      std::string path = tsl::io::JoinPath(opts.dump_dir, name + "_optimized.hlo");
-      absl::Status s = tsl::WriteStringToFile(
-          tsl::Env::Default(), path, optimized_module->ToString());
-      if (s.ok()) {
+      std::string path =
+          tsl::io::JoinPath(opts.dump_dir, name + "_optimized.hlo");
+      absl::Status s = tsl::WriteStringToFile(tsl::Env::Default(), path,
+                                              optimized_module->ToString());
+      if (s.ok())
         std::cerr << "Dumped optimized " << name << " HLO to " << path << "\n";
-      } else {
+      else
         std::cerr << "Warning: failed to dump " << name << " HLO: " << s << "\n";
-      }
     }
 
     const se::DeviceDescription& dev = executor->GetDeviceDescription();
-
     gpu::GpuHloCostAnalysis::Options ca_opts{
-        [](const xla::Shape& shape) { return xla::ShapeUtil::ByteSizeOf(shape, 8); }};
+        [](const xla::Shape& shape) {
+          return xla::ShapeUtil::ByteSizeOf(shape, 8);
+        }};
     gpu::GpuHloCostAnalysis cost_analysis(ca_opts, dev);
     if (!optimized_module->entry_computation()->Accept(&cost_analysis).ok()) {
       std::cerr << "Warning: GpuHloCostAnalysis failed for " << name << ".\n";
@@ -287,24 +387,30 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
     int64_t num_kernels = 0, instruction_count = 0;
     for (const HloInstruction* instr :
          optimized_module->entry_computation()->instructions()) {
-      bool is_kernel = (instr->opcode() == HloOpcode::kFusion ||
-                        instr->opcode() == HloOpcode::kCustomCall);
+      ++instruction_count;
+      // Only kFusion and kCustomCall dispatch actual GPU kernels. Skip all
+      // other instructions (kParameter, kTuple, kGetTupleElement, kBitcast,
+      // etc.) — they are zero-cost at runtime, and their memory would be
+      // double-counted since the consuming kernels already account for reading
+      // those bytes in their own bytes_read.
+      const bool is_kernel = instr->opcode() == HloOpcode::kFusion ||
+                             instr->opcode() == HloOpcode::kCustomCall;
+      if (!is_kernel) continue;
+      ++num_kernels;
+
       gpu::EstimateRunTimeData rt;
-      if (gpu::IsCustomCallToDnnConvolution(*instr) || gpu::IsCublasGemm(*instr)) {
+      if (gpu::IsCustomCallToDnnConvolution(*instr) ||
+          gpu::IsCublasGemm(*instr)) {
         // EstimateRunTimeForInstruction falls through to kLoop emitter for
         // kCustomCall, producing wrong launch dimensions. Use a full-occupancy
         // roofline instead: both cuDNN and cuBLAS saturate all SMs.
-        // GpuHloCostAnalysis::HandleCustomCall already provides correct flops
-        // and bytes (tuple temp-buffer/scratch excluded from output bytes).
         int64_t flops     = cost_analysis.flop_count(*instr);
         int64_t bytes_out = cost_analysis.output_bytes_accessed(*instr);
         int64_t bytes_in  = cost_analysis.bytes_accessed(*instr) - bytes_out;
-
         const int64_t num_blocks        = dev.core_count();
         const int64_t threads_per_block = dev.fpus_per_core();
-        absl::Duration compute_time =
-            gpu::GpuPerformanceModelBase::ComputeTime(dev, flops, num_blocks,
-                                                      threads_per_block);
+        absl::Duration compute_time = gpu::GpuPerformanceModelBase::ComputeTime(
+            dev, flops, num_blocks, threads_per_block);
         absl::Duration write_time =
             gpu::GpuPerformanceModelBase::WriteTime(dev, bytes_out);
         absl::Duration read_time =
@@ -316,19 +422,43 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
               read_time, write_time, compute_time, exec_time};
       } else {
         rt = gpu_model.Get().EstimateRunTimeForInstruction(instr, &cost_analysis);
+
+        // CoalescingAnalysis marks reads of kInput transpose/reduce kernels and
+        // Triton "__triton" fusions as non-coalesced, applying a heavy penalty
+        // (element_size / cache_line_size ≈ 1/16 for f32). However:
+        //   - kInput fusions compile to tiled-transpose or warp-shuffle-reduce
+        //     kernels that buffer tiles in shared memory, so global reads ARE
+        //     effectively coalesced.
+        //   - kCustom "__triton" (non-GEMM) fusions let Triton handle memory
+        //     layout internally, also achieving coalesced global access.
+        // Re-estimate read_time at peak (coalesced) bandwidth for these cases.
+        bool needs_coalesced_read_override = false;
+        if (instr->fusion_kind() == HloInstruction::FusionKind::kInput) {
+          needs_coalesced_read_override = true;
+        } else if (instr->fusion_kind() == HloInstruction::FusionKind::kCustom) {
+          auto cfg = instr->backend_config<gpu::GpuBackendConfig>();
+          if (cfg.ok() &&
+              cfg->fusion_backend_config().kind() == gpu::kTritonFusionKind) {
+            needs_coalesced_read_override = true;
+          }
+        }
+        if (needs_coalesced_read_override) {
+          absl::Duration coalesced_read_time = absl::Seconds(
+              1.0 * rt.bytes_read / dev.memory_bandwidth());
+          rt.read_time = coalesced_read_time;
+          rt.exec_time = gpu::GpuPerformanceModelBase::CombineComputeAndMemoryAccessTime(
+              rt.compute_time, coalesced_read_time + rt.write_time);
+        }
       }
-      total_flops += rt.flops;
-      if (is_kernel) {
-        total_bytes_read    += rt.bytes_read;
-        total_bytes_written += rt.bytes_written;
-        total_compute_time  += rt.compute_time;
-        total_memory_time   += rt.read_time + rt.write_time;
-        total_exec_time     += rt.exec_time;
-      }
-      if (instr->opcode() == HloOpcode::kFusion || instr->opcode() == HloOpcode::kCustomCall) ++num_kernels;
-      ++instruction_count;
+      total_flops         += rt.flops;
+      total_bytes_read    += rt.bytes_read;
+      total_bytes_written += rt.bytes_written;
+      total_compute_time  += rt.compute_time;
+      total_memory_time   += rt.read_time + rt.write_time;
+      total_exec_time     += rt.exec_time;
     }
-    total_exec_time += gpu::GpuPerformanceModelBase::kKernelLaunchOverhead * num_kernels;
+    total_exec_time +=
+        gpu::GpuPerformanceModelBase::kKernelLaunchOverhead * num_kernels;
 
     double compute_ms = absl::ToDoubleMilliseconds(total_compute_time);
     double memory_ms  = absl::ToDoubleMilliseconds(total_memory_time);
@@ -344,11 +474,8 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
               << "[" << name << "] Memory time: " << memory_ms << "ms\n"
               << "[" << name << "] Estimated exec time: " << exec_ms
               << "ms (GpuPerformanceModel)\n";
-    if (compute_ms > memory_ms) {
-      std::cerr << ">>> Compute-bound <<<\n";
-    } else {
-      std::cerr << ">>> Memory-bound <<<\n";
-    }
+    std::cerr << (compute_ms > memory_ms ? ">>> Compute-bound <<<\n"
+                                         : ">>> Memory-bound <<<\n");
 
     CostMetrics metrics;
     metrics.kernel_count      = num_kernels;
@@ -359,33 +486,51 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
     return metrics;
   };
 
-  // 分别对 LHS 和 RHS 执行耗时评估
   auto lhs_metrics = run_cost_analysis(lhs_module.get(), "LHS");
   std::cerr << "-\n";
   auto rhs_metrics = run_cost_analysis(rhs_module.get(), "RHS");
   std::cerr << "-------------------------------------------\n";
 
-  std::cerr << "-------------------------------------------\n";
-
-  // 4. AOT 提前编译阶段 (消耗原始 Module)
+  // ── Phase 4: Compile LHS ──────────────────────────────────────────────────
   std::cerr << "Compiling LHS Executable...\n";
   auto compile_start = std::chrono::high_resolution_clock::now();
-  lhs_module->mutable_config().mutable_debug_options().add_xla_disable_hlo_passes("algsimp");
-  TF_ASSIGN_OR_RETURN(std::unique_ptr<OpaqueExecutable> lhs_exec,
-                      runner.CreateExecutable(std::move(lhs_module), /*run_hlo_passes=*/true));
+  lhs_module->mutable_config()
+      .mutable_debug_options()
+      .add_xla_disable_hlo_passes("algsimp");
+  auto lhs_exec_or =
+      runner.CreateExecutable(std::move(lhs_module), /*run_hlo_passes=*/true);
+  if (!lhs_exec_or.ok()) {
+    std::cerr << "Runtime error (LHS): " << lhs_exec_or.status().message() << "\n";
+    PrintConclusion(HloCompConclusion::kRuntimeError, "LHS",
+                    lhs_exec_or.status().message());
+    return lhs_exec_or.status();
+  }
+  std::unique_ptr<OpaqueExecutable> lhs_exec = std::move(lhs_exec_or).value();
   auto compile_mid = std::chrono::high_resolution_clock::now();
-  std::cerr << "LHS compiled in " 
-            << std::chrono::duration<double>(compile_mid - compile_start).count() << "s.\n";
+  std::cerr << "LHS compiled in "
+            << std::chrono::duration<double>(compile_mid - compile_start).count()
+            << "s.\n";
 
+  // ── Phase 4b: Compile RHS ─────────────────────────────────────────────────
   std::cerr << "Compiling RHS Executable...\n";
-  rhs_module->mutable_config().mutable_debug_options().add_xla_disable_hlo_passes("algsimp");
-  TF_ASSIGN_OR_RETURN(std::unique_ptr<OpaqueExecutable> rhs_exec,
-                      runner.CreateExecutable(std::move(rhs_module), /*run_hlo_passes=*/true));
+  rhs_module->mutable_config()
+      .mutable_debug_options()
+      .add_xla_disable_hlo_passes("algsimp");
+  auto rhs_exec_or =
+      runner.CreateExecutable(std::move(rhs_module), /*run_hlo_passes=*/true);
+  if (!rhs_exec_or.ok()) {
+    std::cerr << "Runtime error (RHS): " << rhs_exec_or.status().message() << "\n";
+    PrintConclusion(HloCompConclusion::kRuntimeError, "RHS",
+                    rhs_exec_or.status().message());
+    return rhs_exec_or.status();
+  }
+  std::unique_ptr<OpaqueExecutable> rhs_exec = std::move(rhs_exec_or).value();
   auto compile_end = std::chrono::high_resolution_clock::now();
-  std::cerr << "RHS compiled in " 
-            << std::chrono::duration<double>(compile_end - compile_mid).count() << "s.\n";
+  std::cerr << "RHS compiled in "
+            << std::chrono::duration<double>(compile_end - compile_mid).count()
+            << "s.\n";
 
-  // 5. Generate all N+2 input sets upfront so LHS and RHS see identical inputs.
+  // ── Phase 5: Generate inputs ──────────────────────────────────────────────
   std::minstd_rand0 engine;
   ErrorSpec error_spec(1e-3, 1e-3);
   const int total_iters = opts.iterations + 2;  // 2 warm-up + N measured
@@ -399,7 +544,6 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
                                           /*treat_gte_as_data_formatting=*/false));
   }
 
-  // Helper: build a const-pointer span over one input set.
   auto make_ptrs = [](const std::vector<Literal>& args) {
     std::vector<const Literal*> ptrs;
     ptrs.reserve(args.size());
@@ -407,58 +551,81 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
     return ptrs;
   };
 
-  // 6. LHS block: warm-up then N measured runs.
+  // ── Phase 5: Run LHS ──────────────────────────────────────────────────────
   std::cerr << "\nRunning LHS block...\n";
   std::vector<Literal> lhs_results(opts.iterations);
   std::vector<double>  lhs_times(opts.iterations);
   for (int i = 0; i < total_iters; ++i) {
     ExecutionProfile profile;
     auto ptrs = make_ptrs(all_args[i]);
-    TF_ASSIGN_OR_RETURN(Literal result,
-                        runner.ExecuteWithExecutableAndProfile(lhs_exec.get(), ptrs, &profile));
+    auto result_or = runner.ExecuteWithExecutableAndProfile(
+        lhs_exec.get(), ptrs, &profile);
+    if (!result_or.ok()) {
+      std::cerr << "Runtime error (LHS): " << result_or.status().message() << "\n";
+      PrintConclusion(HloCompConclusion::kRuntimeError, "LHS",
+                      result_or.status().message());
+      return result_or.status();
+    }
     if (i < 2) {
       std::cerr << "LHS warm-up iteration " << i + 1 << " completed.\n";
       continue;
     }
-    lhs_results[i - 2] = std::move(result);
+    lhs_results[i - 2] = std::move(result_or).value();
     lhs_times[i - 2] = static_cast<double>(profile.compute_time_ns()) / 1e6;
-		std::cerr << "LHS iteration " << i - 1 << " completed in " << lhs_times[i - 2] << "ms.\n";
+    std::cerr << "LHS iteration " << i - 1 << " completed in "
+              << lhs_times[i - 2] << "ms.\n";
   }
 
-  // 7. RHS block: warm-up then N measured runs; compare on-the-fly with stored LHS results.
+  // ── Phase 6: Run RHS and compare ─────────────────────────────────────────
   std::cerr << "\nRunning RHS block...\n";
   std::vector<double> rhs_times(opts.iterations);
   for (int i = 0; i < total_iters; ++i) {
     ExecutionProfile profile;
     auto ptrs = make_ptrs(all_args[i]);
-    TF_ASSIGN_OR_RETURN(Literal rhs_result,
-                        runner.ExecuteWithExecutableAndProfile(rhs_exec.get(), ptrs, &profile));
+    auto result_or = runner.ExecuteWithExecutableAndProfile(
+        rhs_exec.get(), ptrs, &profile);
+    if (!result_or.ok()) {
+      std::cerr << "Runtime error (RHS): " << result_or.status().message() << "\n";
+      PrintConclusion(HloCompConclusion::kRuntimeError, "RHS",
+                      result_or.status().message());
+      return result_or.status();
+    }
     if (i < 2) {
       std::cerr << "RHS warm-up iteration " << i + 1 << " completed.\n";
       continue;
     }
+    Literal rhs_result = std::move(result_or).value();
     rhs_times[i - 2] = static_cast<double>(profile.compute_time_ns()) / 1e6;
+
     absl::Status cmp = literal_comparison::Near(
-        lhs_results[i - 2], rhs_result, error_spec, /*detailed_message=*/true, &OnMiscompare);
+        lhs_results[i - 2], rhs_result, error_spec,
+        /*detailed_message=*/true, &OnMiscompare);
     if (!cmp.ok()) {
       std::cerr << "Mismatch detected at iteration " << i - 1 << "!\n";
+      PrintConclusion(HloCompConclusion::kNotEquivalent);
       return cmp;
     }
-		std::cerr << "RHS iteration " << i - 1 << " completed in " << rhs_times[i - 2] << "ms.\n";
+    std::cerr << "RHS iteration " << i - 1 << " completed in "
+              << rhs_times[i - 2] << "ms.\n";
   }
 
-  // 8. Compute averages and print unified comparison table.
+  // ── Phase 7: Verdict ──────────────────────────────────────────────────────
   double total_lhs_time = 0.0, total_rhs_time = 0.0;
   for (int i = 0; i < opts.iterations; ++i) {
     total_lhs_time += lhs_times[i];
     total_rhs_time += rhs_times[i];
   }
+  double avg_lhs_ms = total_lhs_time / opts.iterations;
+  double avg_rhs_ms = total_rhs_time / opts.iterations;
 
   std::cerr << "\nSuccess! LHS and RHS are equivalent across "
             << opts.iterations << " random inputs.\n";
-  PrintComparisonTable(lhs_metrics, rhs_metrics,
-                       total_lhs_time / opts.iterations,
-                       total_rhs_time / opts.iterations);
+
+  PrintComparisonTable(lhs_metrics, rhs_metrics, avg_lhs_ms, avg_rhs_ms);
+
+  HloCompConclusion verdict =
+      DetermineVerdict(lhs_metrics, rhs_metrics, avg_lhs_ms, avg_rhs_ms);
+  PrintConclusion(verdict);
   return absl::OkStatus();
 }
 
@@ -468,16 +635,22 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
 int main(int argc, char** argv) {
   xla::HloCompConfig opts;
   std::vector<tsl::Flag> flag_list = {
-      tsl::Flag("input_format", &opts.input_format, "The format of the input file."),
-      tsl::Flag("lhs_file", &opts.lhs_file, "Path to the left-hand-side HLO module."),
-      tsl::Flag("rhs_file", &opts.rhs_file, "Path to the right-hand-side HLO module."),
-      tsl::Flag("platform", &opts.platform, "The test platform (gpu, cpu, etc)."),
-      tsl::Flag("iterations", &opts.iterations, "The number of times to run the module."),
+      tsl::Flag("input_format", &opts.input_format,
+                "The format of the input file."),
+      tsl::Flag("lhs_file", &opts.lhs_file,
+                "Path to the left-hand-side HLO module."),
+      tsl::Flag("rhs_file", &opts.rhs_file,
+                "Path to the right-hand-side HLO module."),
+      tsl::Flag("platform", &opts.platform,
+                "The test platform (gpu, cpu, etc)."),
+      tsl::Flag("iterations", &opts.iterations,
+                "The number of times to run the module."),
       tsl::Flag("dump_dir", &opts.dump_dir,
-                "If set, dump post-optimization HLO for LHS and RHS into this directory.")};
-        
+                "If set, dump post-optimization HLO for LHS and RHS into this "
+                "directory.")};
+
   const std::string kUsageString =
-      absl::StrCat(kUsage, "\n\n", tsl::Flags::Usage(argv[ 0 ], flag_list));
+      absl::StrCat(kUsage, "\n\n", tsl::Flags::Usage(argv[0], flag_list));
 
   bool parse_ok = tsl::Flags::Parse(&argc, argv, flag_list);
   if (!parse_ok) {
@@ -487,7 +660,6 @@ int main(int argc, char** argv) {
   tsl::port::InitMain(kUsageString.c_str(), &argc, &argv);
 
   absl::Status status = xla::RunHloComp(opts);
-
   if (!status.ok()) {
     std::cerr << status << std::endl;
     return 1;
