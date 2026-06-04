@@ -22,6 +22,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/backends/autotuner/autotuner_cache.pb.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -37,6 +38,9 @@ class AutotunerCacheInterface {
   struct Config {
     std::string codegen_backend_name;
     google::protobuf::Any backend_config;
+    // Measured runtime of the best config, if it was profiled. Zero means
+    // unknown (e.g. profiling was skipped because there was a single candidate).
+    absl::Duration duration = absl::ZeroDuration();
   };
 
   virtual ~AutotunerCacheInterface() = default;

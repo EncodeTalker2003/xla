@@ -181,14 +181,17 @@ class Autotuner {
   // to find the best config, inserts it into cache and returns it.
   absl::StatusOr<Config> GetConfig(HloInstruction* instr);
   // Gets the best config for the given instruction by compiling and profiling
-  // all supported configs.
-  absl::StatusOr<Config> TuneBestConfig(HloInstruction* instr);
+  // all supported configs. If `best_duration` is non-null, it is set to the
+  // measured runtime of the best config (or zero if profiling was skipped).
+  absl::StatusOr<Config> TuneBestConfig(HloInstruction* instr,
+                                        absl::Duration* best_duration = nullptr);
 
   // TODO: b/407494653 - Directly use cache api when the configs are unified.
   // Translates from Autotuner::Config to AutotunerCacheInterface::Config and
   // the other way around.
   std::optional<Autotuner::Config> LookUp(const HloInstruction* instr);
-  void Insert(const HloInstruction* instr, Autotuner::Config& config);
+  void Insert(const HloInstruction* instr, Autotuner::Config& config,
+              absl::Duration duration);
 
   absl::StatusOr<std::vector<Config>> GetSupportedConfigs(
       HloInstruction* instr);

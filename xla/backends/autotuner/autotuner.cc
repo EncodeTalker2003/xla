@@ -302,13 +302,14 @@ absl::StatusOr<Autotuner::Config> Autotuner::GetConfig(HloInstruction* instr) {
   }
 
   VLOG(1) << "Autotuning the HLO instruction to find best config.";
-  TF_ASSIGN_OR_RETURN(Config best_config, TuneBestConfig(instr));
-  Insert(instr, best_config);
+  absl::Duration best_duration = absl::ZeroDuration();
+  TF_ASSIGN_OR_RETURN(Config best_config, TuneBestConfig(instr, &best_duration));
+  Insert(instr, best_config, best_duration);
   return best_config;
 }
 
 absl::StatusOr<Autotuner::Config> Autotuner::TuneBestConfig(
-    HloInstruction* instr) {
+    HloInstruction* instr, absl::Duration* best_duration) {
   TF_ASSIGN_OR_RETURN(std::vector<Config> supported_configs,
                       GetSupportedConfigs(instr));
   if (supported_configs.empty()) {
@@ -359,6 +360,7 @@ absl::StatusOr<Autotuner::Config> Autotuner::TuneBestConfig(
     VLOG(1) << "Skipping profiling and using the "
             << (autotune_config_.select_first_config ? "first" : "only")
             << " config: " << executable_candidates[0].config.ToString();
+    if (best_duration != nullptr) *best_duration = absl::ZeroDuration();
     return std::move(executable_candidates[0].config);
   }
 
@@ -372,6 +374,7 @@ absl::StatusOr<Autotuner::Config> Autotuner::TuneBestConfig(
                      " with error: ", best_result.status().ToString()));
   }
   VLOG(1) << "Picked best config: " << best_result.value().ToString();
+  if (best_duration != nullptr) *best_duration = best_result.value().duration;
   return std::move(best_result.value().config);
 }
 
@@ -409,11 +412,13 @@ std::optional<Autotuner::Config> Autotuner::LookUp(
   return std::nullopt;
 }
 
-void Autotuner::Insert(const HloInstruction* instr, Autotuner::Config& config) {
+void Autotuner::Insert(const HloInstruction* instr, Autotuner::Config& config,
+                       absl::Duration duration) {
   if (cache_) {
     AutotunerCacheInterface::Config cached_config;
     cached_config.codegen_backend_name = config.codegen_backend->name();
     cached_config.backend_config = *config.backend_config;
+    cached_config.duration = duration;
     CHECK_OK(cache_->Insert(instr, cached_config));
   }
 }

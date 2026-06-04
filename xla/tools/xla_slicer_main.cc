@@ -187,7 +187,7 @@ absl::Status RunXlaSlicer(const XlaSlicerConfig& opts) {
     // This makes slices that differ only in their starting offset
     // (e.g., [0:1] vs [1:2]) hash to the same fingerprint.
     // Whitelisted sub-computations are guaranteed to contain no kSlice.
-    for (HloInstruction* inst :
+         for (HloInstruction* inst :
          fp_module->entry_computation()->instructions()) {
       if (inst->opcode() == HloOpcode::kSlice) {
         auto* slice = Cast<HloSliceInstruction>(inst);

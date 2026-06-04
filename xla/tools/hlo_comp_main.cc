@@ -11,6 +11,7 @@
 
 #include "absl/log/check.h"
 #include "absl/status/status.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "xla/error_spec.h"
 #include "xla/literal.h"
@@ -27,6 +28,10 @@
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/cublas_cudnn.h"
 #include "xla/service/gpu/ir_emission_utils.h"
+#include "xla/autotuning.pb.h"
+#include "xla/autotune_results.pb.h"
+#include "xla/service/gpu/autotuning/autotune_cache_key.h"
+#include "xla/service/gpu/autotuning/autotuner_util.h"
 #include "xla/service/gpu/model/gpu_hlo_cost_analysis.h"
 #include "xla/service/gpu/model/gpu_performance_model.h"
 #include "xla/service/gpu/model/gpu_performance_model_base.h"
@@ -77,23 +82,25 @@ void PrintConclusion(HloCompConclusion conclusion,
   };
   switch (conclusion) {
     case HloCompConclusion::kGrammarError:
-      std::cout << "CONCLUSION: " << side << " has grammar issues";
+      std::cout << "CONCLUSION: " << side << " has grammar issues" << std::endl;
       append_detail();
       std::cout << "\n";
       break;
     case HloCompConclusion::kRuntimeError:
-      std::cout << "CONCLUSION: " << side << " has runtime errors";
+      std::cout << "CONCLUSION: " << side << " has runtime errors" << std::endl;
       append_detail();
       std::cout << "\n";
       break;
     case HloCompConclusion::kNotEquivalent:
-      std::cout << "CONCLUSION: LHS and RHS are not equivalent\n";
+      std::cout << "CONCLUSION: Original HLO Program and HLO program proposed by LLM are not equivalent" << std::endl;
+      append_detail();
       break;
     case HloCompConclusion::kRhsNotBetter:
-      std::cout << "CONCLUSION: RHS is not more profitable than LHS\n";
+      std::cout << "CONCLUSION: HLO program proposed by LLM is not more profitable than Original HLO Program" << std::endl;
+      append_detail();
       break;
     case HloCompConclusion::kRhsBetter:
-      std::cout << "CONCLUSION: RHS is more profitable than LHS\n";
+      std::cout << "CONCLUSION: HLO program proposed by LLM is more profitable than Original HLO Program" << std::endl;
       break;
   }
   std::cout.flush();
@@ -125,7 +132,9 @@ struct CostMetrics {
 // only (>5% threshold required for kRhsBetter).
 HloCompConclusion DetermineVerdict(const std::optional<CostMetrics>& lhs_opt,
                                    const std::optional<CostMetrics>& rhs_opt,
-                                   double avg_lhs_ms, double avg_rhs_ms) {
+                                   double avg_lhs_ms, double avg_rhs_ms,
+                                   int64_t lhs_raw_inst_count,
+                                   int64_t rhs_raw_inst_count) {
   constexpr double kThreshold = 0.05;
 
   if (lhs_opt && rhs_opt) {
@@ -138,11 +147,11 @@ HloCompConclusion DetermineVerdict(const std::optional<CostMetrics>& lhs_opt,
 
     
 
-		if (rhs_static_ms < lhs_static_ms * 0.96 || rhs_static_ms < lhs_static_ms - 0.01) {
+		if (rhs_static_ms < lhs_static_ms * 0.98 || rhs_static_ms < lhs_static_ms - 0.01) {
 			return HloCompConclusion::kRhsBetter;
-		} else if (lhs_static_ms < rhs_static_ms * 0.96 || lhs_static_ms < rhs_static_ms - 0.01) {
+		} else if (lhs_static_ms < rhs_static_ms * 0.98 || lhs_static_ms < rhs_static_ms - 0.01) {
 			return HloCompConclusion::kRhsNotBetter;
-		} else if (rm.instruction_count < lm.instruction_count) {
+		} else if (rhs_raw_inst_count < lhs_raw_inst_count * 0.7) {
 			return HloCompConclusion::kRhsBetter;
 		} else {
 			return HloCompConclusion::kRhsNotBetter;
@@ -188,25 +197,31 @@ HloCompConclusion DetermineVerdict(const std::optional<CostMetrics>& lhs_opt,
 
 void PrintComparisonTable(const std::optional<CostMetrics>& lhs_opt,
                           const std::optional<CostMetrics>& rhs_opt,
-                          double avg_lhs_ms, double avg_rhs_ms) {
-  constexpr double kThreshold = 0.05;
-
-  auto winner_str = [](auto lv, auto rv) -> const char* {
-    if (lv < rv) return "LHS";
-    if (rv < lv) return "RHS";
+                          double avg_lhs_ms, double avg_rhs_ms,
+                          int64_t lhs_raw_inst_count,
+                          int64_t rhs_raw_inst_count) {
+  // Mirrors the threshold in DetermineVerdict exactly.
+  auto time_winner = [](double lv, double rv) -> const char* {
+    if (rv < lv * 0.98 || rv < lv - 0.01) return "LLM";
+    if (lv < rv * 0.98 || lv < rv - 0.01) return "Original";
     return "tie";
   };
-  auto ratio_winner = [&](double lv, double rv) -> const char* {
-    if (rv < lv * (1.0 - kThreshold)) return "RHS";
-    if (lv < rv * (1.0 - kThreshold)) return "LHS";
+  auto abs_winner = [](auto lv, auto rv) -> const char* {
+    if (lv < rv) return "Original";
+    if (rv < lv) return "LLM";
+    return "tie";
+  };
+	auto inst_winner = [](auto lv, auto rv) -> const char* {
+    if (lv < rv * 0.7) return "Original";
+    if (rv < lv * 0.7) return "LLM";
     return "tie";
   };
 
-  std::cerr << "\n=== Comparison Table ===\n"
+  std::cout << "\n=== Comparison Table ===\n"
             << std::left
             << std::setw(24) << "Metric"
-            << std::setw(16) << "LHS"
-            << std::setw(16) << "RHS"
+            << std::setw(16) << "Original"
+            << std::setw(16) << "LLM Proposed"
             << "Winner\n"
             << std::string(62, '-') << "\n";
 
@@ -217,47 +232,70 @@ void PrintComparisonTable(const std::optional<CostMetrics>& lhs_opt,
     double rhs_static_ms = absl::ToDoubleMilliseconds(rm.total_exec_time);
     double lhbm_mb = lm.total_hbm_bytes / 1.0e6;
     double rhbm_mb = rm.total_hbm_bytes / 1.0e6;
-    std::cerr << std::setw(24) << "Total FLOPs"
+
+    // Decision metrics in priority order (match DetermineVerdict).
+    std::cout << std::fixed << std::setprecision(6)
+              << std::setw(24) << "Static exec time (ms)"
+              << std::setw(16) << lhs_static_ms
+              << std::setw(16) << rhs_static_ms
+              << time_winner(lhs_static_ms, rhs_static_ms) << "\n"
+              << std::defaultfloat
+              << std::setw(24) << "Raw inst count"
+              << std::setw(16) << lhs_raw_inst_count
+              << std::setw(16) << rhs_raw_inst_count
+              << inst_winner(lhs_raw_inst_count, rhs_raw_inst_count) << "\n"
+              << std::setw(24) << "Inst count (opt)"
+              << std::setw(16) << lm.instruction_count
+              << std::setw(16) << rm.instruction_count
+              << "--\n";
+
+    // Informational metrics (Winner not applicable — does not drive verdict).
+    std::cout << std::setw(24) << "Total FLOPs"
               << std::setw(16) << lm.total_flops
               << std::setw(16) << rm.total_flops
-              << winner_str(lm.total_flops, rm.total_flops) << "\n"
-              << std::fixed << std::setprecision(2)
+              << "--\n"
+              << std::fixed << std::setprecision(4)
               << std::setw(24) << "HBM traffic (MB)"
               << std::setw(16) << lhbm_mb
               << std::setw(16) << rhbm_mb
-              << ratio_winner(lhbm_mb, rhbm_mb) << "\n"
+              << "--\n"
               << std::defaultfloat
               << std::setw(24) << "Kernel count"
               << std::setw(16) << lm.kernel_count
               << std::setw(16) << rm.kernel_count
-              << winner_str(lm.kernel_count, rm.kernel_count) << "\n"
-              << std::setw(24) << "Static exec time (ms)"
-              << std::setw(16) << lhs_static_ms
-              << std::setw(16) << rhs_static_ms
-              << ratio_winner(lhs_static_ms, rhs_static_ms) << "\n"
-              << std::setw(24) << "Instruction count"
-              << std::setw(16) << lm.instruction_count
-              << std::setw(16) << rm.instruction_count
-              << winner_str(lm.instruction_count, rm.instruction_count) << "\n";
+              << "--\n"
+              << std::fixed << std::setprecision(6)
+              << std::setw(24) << "Real exec time (ms)"
+              << std::setw(16) << avg_lhs_ms
+              << std::setw(16) << avg_rhs_ms
+              << "--\n"
+              << std::defaultfloat;
   } else {
-    std::cerr << std::setw(24) << "Kernel count"
-              << std::setw(16) << "N/A" << std::setw(16) << "N/A" << "N/A\n"
+    // Static metrics unavailable — real exec time is the decision metric.
+    std::cout << std::fixed << std::setprecision(6)
+              << std::setw(24) << "Real exec time (ms)"
+              << std::setw(16) << avg_lhs_ms
+              << std::setw(16) << avg_rhs_ms
+              << time_winner(avg_lhs_ms, avg_rhs_ms) << "\n"
+              << std::defaultfloat;
+
+    // Raw inst count is still available even when static metrics failed.
+    std::cout << std::setw(24) << "Raw inst count"
+              << std::setw(16) << lhs_raw_inst_count
+              << std::setw(16) << rhs_raw_inst_count
+              << abs_winner(lhs_raw_inst_count, rhs_raw_inst_count) << "\n";
+    // All other static metrics are N/A — show as informational.
+    std::cout << std::setw(24) << "Static exec time (ms)"
+              << std::setw(16) << "N/A" << std::setw(16) << "N/A" << "--\n"
+              << std::setw(24) << "Inst count (opt)"
+              << std::setw(16) << "N/A" << std::setw(16) << "N/A" << "--\n"
               << std::setw(24) << "Total FLOPs"
-              << std::setw(16) << "N/A" << std::setw(16) << "N/A" << "N/A\n"
+              << std::setw(16) << "N/A" << std::setw(16) << "N/A" << "--\n"
               << std::setw(24) << "HBM traffic (MB)"
-              << std::setw(16) << "N/A" << std::setw(16) << "N/A" << "N/A\n"
-              << std::setw(24) << "Static exec time (ms)"
-              << std::setw(16) << "N/A" << std::setw(16) << "N/A" << "N/A\n"
-              << std::setw(24) << "Instruction count"
-              << std::setw(16) << "N/A" << std::setw(16) << "N/A" << "N/A\n";
+              << std::setw(16) << "N/A" << std::setw(16) << "N/A" << "--\n"
+              << std::setw(24) << "Kernel count"
+              << std::setw(16) << "N/A" << std::setw(16) << "N/A" << "--\n";
   }
-  std::cerr << std::setw(24) << "Real exec time (ms)"
-            << std::setw(16) << avg_lhs_ms
-            << std::setw(16) << avg_rhs_ms
-            << ratio_winner(avg_lhs_ms, avg_rhs_ms) << "\n"
-            << std::string(62, '-') << "\n";
-  std::cerr << "Note: HLO-level metrics may underestimate benefits of "
-               "backend-fusion restructuring.\n";
 }
 
 // ── Main comparison logic ─────────────────────────────────────────────────────
@@ -273,7 +311,7 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
   auto lhs_module_or = LoadModuleFromFile(opts.lhs_file, format);
   if (!lhs_module_or.ok()) {
     std::cerr << "Grammar error (LHS): " << lhs_module_or.status().message() << "\n";
-    PrintConclusion(HloCompConclusion::kGrammarError, "LHS",
+    PrintConclusion(HloCompConclusion::kGrammarError, "Original HLO Program",
                     lhs_module_or.status().message());
     return lhs_module_or.status();
   }
@@ -284,17 +322,20 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
   auto lhs_verify = verifier.Run(lhs_module.get());
   if (!lhs_verify.ok()) {
     std::cerr << "Grammar error (LHS): " << lhs_verify.status().message() << "\n";
-    PrintConclusion(HloCompConclusion::kGrammarError, "LHS",
+    PrintConclusion(HloCompConclusion::kGrammarError, "Original HLO Program",
                     lhs_verify.status().message());
     return lhs_verify.status();
   }
+  int64_t lhs_raw_inst_count =
+      lhs_module->entry_computation()->instruction_count();
+  std::cerr << "[LHS] Raw instruction count: " << lhs_raw_inst_count << "\n";
 
   // ── Phase 1b: Load and verify RHS ────────────────────────────────────────
   std::cerr << "Loading RHS module...\n";
   auto rhs_module_or = LoadModuleFromFile(opts.rhs_file, format);
   if (!rhs_module_or.ok()) {
     std::cerr << "Grammar error (RHS): " << rhs_module_or.status().message() << "\n";
-    PrintConclusion(HloCompConclusion::kGrammarError, "RHS",
+    PrintConclusion(HloCompConclusion::kGrammarError, "HLO program proposed by LLM",
                     rhs_module_or.status().message());
     return rhs_module_or.status();
   }
@@ -303,23 +344,26 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
   auto rhs_verify = verifier.Run(rhs_module.get());
   if (!rhs_verify.ok()) {
     std::cerr << "Grammar error (RHS): " << rhs_verify.status().message() << "\n";
-    PrintConclusion(HloCompConclusion::kGrammarError, "RHS",
+    PrintConclusion(HloCompConclusion::kGrammarError, "HLO program proposed by LLM",
                     rhs_verify.status().message());
     return rhs_verify.status();
   }
+  int64_t rhs_raw_inst_count =
+      rhs_module->entry_computation()->instruction_count();
+  std::cerr << "[RHS] Raw instruction count: " << rhs_raw_inst_count << "\n";
 
   // ── Phase 2: Signature check ──────────────────────────────────────────────
   const auto* lhs_entry = lhs_module->entry_computation();
   const auto* rhs_entry = rhs_module->entry_computation();
   if (lhs_entry->num_parameters() != rhs_entry->num_parameters()) {
-    PrintConclusion(HloCompConclusion::kNotEquivalent);
+    PrintConclusion(HloCompConclusion::kNotEquivalent, "", "Parameter count mismatch");
     return absl::InvalidArgumentError(
         "LHS and RHS entry computations have a different number of parameters.");
   }
   for (int i = 0; i < lhs_entry->num_parameters(); ++i) {
     if (!ShapeUtil::Equal(lhs_entry->parameter_instruction(i)->shape(),
                           rhs_entry->parameter_instruction(i)->shape())) {
-      PrintConclusion(HloCompConclusion::kNotEquivalent);
+      PrintConclusion(HloCompConclusion::kNotEquivalent, "", "Parameter shape mismatch");
       return absl::InvalidArgumentError(
           "LHS and RHS entry computation parameter shapes do not match.");
     }
@@ -381,6 +425,67 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
       return std::nullopt;
     }
 
+    // Harvest the measured run_times stored in the process-global autotune cache
+    // (populated during RunHloPasses for cuDNN conv, cuBLAS GEMM, Triton GEMM).
+    // The autotuner keys its results on the PRE-optimization instruction (before
+    // the chosen algorithm / scratch buffer is baked into a conv, and before a
+    // Triton gemm fusion is re-nested), so an AutotuneCacheKey lookup on the
+    // optimized instruction misses. Instead we read all stored results and bucket
+    // them by autotuner result type, then match them to optimized kernels by type
+    // (and output shape when more than one candidate exists) below.
+    struct MeasuredKernel {
+      std::string hlo;
+      absl::Duration run_time;
+    };
+    std::vector<MeasuredKernel> conv_times, triton_times, cublas_times;
+    {
+      AutotuneResults harvested;
+      if (gpu::AutotunerUtil::SerializeAutotuneResults(&harvested).ok()) {
+        for (const auto& e : harvested.results()) {
+          const AutotuneResult& r = e.result();
+          if (!r.has_run_time()) continue;               // no measurement stored
+					std::cout << "Find sth interesting" << std::endl;
+          absl::Duration t = absl::Seconds(r.run_time().seconds()) +
+                             absl::Nanoseconds(r.run_time().nanos());
+          if (r.has_algorithm() || r.has_cuda_conv_plan()) {
+						std::cout << "Push convolution time" << std::endl;
+            conv_times.push_back({e.hlo(), t});
+          } else if (r.has_triton()) {
+						std::cout << "Push triton time" << std::endl;
+            triton_times.push_back({e.hlo(), t});
+          } else if (r.has_gemm()) {
+						std::cout << "Push gemm time" << std::endl;
+            cublas_times.push_back({e.hlo(), t});
+          }
+        }
+      }
+    }
+
+    // Returns the measured autotuned exec time for `instr` from `bucket`, or
+    // nullopt. With a single candidate the match is unambiguous; otherwise we
+    // disambiguate by checking the kernel's primary (non-scratch) output shape
+    // appears in the cached entry's canonical HLO, and give up if still unclear.
+    auto match_measured_time =
+        [](const HloInstruction* instr,
+           const std::vector<MeasuredKernel>& bucket)
+        -> std::optional<absl::Duration> {
+      if (bucket.empty()) return std::nullopt;
+      if (bucket.size() == 1) return bucket.front().run_time;
+      const Shape& primary = instr->shape().IsTuple()
+                                 ? instr->shape().tuple_shapes(0)
+                                 : instr->shape();
+      std::string shape_str = primary.ToString(/*print_layout=*/true);
+      const MeasuredKernel* hit = nullptr;
+      for (const auto& k : bucket) {
+        if (absl::StrContains(k.hlo, shape_str)) {
+          if (hit != nullptr) return std::nullopt;  // ambiguous
+          hit = &k;
+        }
+      }
+      if (hit != nullptr) return hit->run_time;
+      return std::nullopt;
+    };
+
     gpu::GpuPerformanceModelOwning gpu_model(dev, &mlir_ctx);
     int64_t total_flops = 0, total_bytes_read = 0, total_bytes_written = 0;
     absl::Duration total_compute_time, total_memory_time, total_exec_time;
@@ -399,7 +504,58 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
       ++num_kernels;
 
       gpu::EstimateRunTimeData rt;
-      if (gpu::IsCustomCallToDnnConvolution(*instr) ||
+      // Reuse the autotuner's measured run_time for conv/gemm kernels. The
+      // roofline model cannot distinguish kernels with identical FLOPs/bytes but
+      // very different real speed (e.g. a cuDNN grouped conv vs a Triton GEMM),
+      // so for those we substitute the measured time harvested above. Select the
+      // matching bucket by kernel type.
+      const std::vector<MeasuredKernel>* bucket = nullptr;
+      const char* bucket_kind = nullptr;
+      if (gpu::IsCustomCallToDnnConvolution(*instr)) {
+        bucket = &conv_times;
+        bucket_kind = "conv";
+      } else if (gpu::IsCublasGemm(*instr)) {
+        bucket = &cublas_times;
+        bucket_kind = "cublas-gemm";
+      } else if (instr->opcode() == HloOpcode::kFusion &&
+                 instr->fusion_kind() == HloInstruction::FusionKind::kCustom) {
+        auto cfg = instr->backend_config<gpu::GpuBackendConfig>();
+        if (cfg.ok()) {
+          absl::string_view k = cfg->fusion_backend_config().kind();
+          if (k == gpu::kTritonGemmFusionKind ||
+              k == gpu::kTritonNestedGemmFusionKind) {
+            bucket = &triton_times;
+            bucket_kind = "triton-gemm";
+          }
+        }
+      }
+
+      std::optional<absl::Duration> measured;
+      if (bucket != nullptr) {
+        measured = match_measured_time(instr, *bucket);
+        if (!measured.has_value()) {
+          std::cerr << "  [autotuner] WARNING: " << instr->name() << " ("
+                    << bucket_kind
+                    << ") had no matched measured time; using roofline\n";
+        }
+      }
+
+      if (measured.has_value()) {
+        int64_t flops     = cost_analysis.flop_count(*instr);
+        int64_t bytes_out = cost_analysis.output_bytes_accessed(*instr);
+        int64_t bytes_in  = cost_analysis.bytes_accessed(*instr) - bytes_out;
+        absl::Duration read_time =
+            absl::Seconds(1.0 * bytes_in / dev.memory_bandwidth());
+        absl::Duration write_time =
+            gpu::GpuPerformanceModelBase::WriteTime(dev, bytes_out);
+        absl::Duration compute_time = gpu::GpuPerformanceModelBase::ComputeTime(
+            dev, flops, dev.core_count(), dev.fpus_per_core());
+        rt = {flops, bytes_in, bytes_out,
+              read_time, write_time, compute_time, *measured};
+        std::cerr << "  [autotuner] " << instr->name() << " (" << bucket_kind
+                  << "): " << absl::ToDoubleMilliseconds(*measured)
+                  << "ms (measured)\n";
+      } else if (gpu::IsCustomCallToDnnConvolution(*instr) ||
           gpu::IsCublasGemm(*instr)) {
         // EstimateRunTimeForInstruction falls through to kLoop emitter for
         // kCustomCall, producing wrong launch dimensions. Use a full-occupancy
@@ -501,7 +657,7 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
       runner.CreateExecutable(std::move(lhs_module), /*run_hlo_passes=*/true);
   if (!lhs_exec_or.ok()) {
     std::cerr << "Runtime error (LHS): " << lhs_exec_or.status().message() << "\n";
-    PrintConclusion(HloCompConclusion::kRuntimeError, "LHS",
+    PrintConclusion(HloCompConclusion::kRuntimeError, "Original HLO Program",
                     lhs_exec_or.status().message());
     return lhs_exec_or.status();
   }
@@ -520,7 +676,7 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
       runner.CreateExecutable(std::move(rhs_module), /*run_hlo_passes=*/true);
   if (!rhs_exec_or.ok()) {
     std::cerr << "Runtime error (RHS): " << rhs_exec_or.status().message() << "\n";
-    PrintConclusion(HloCompConclusion::kRuntimeError, "RHS",
+    PrintConclusion(HloCompConclusion::kRuntimeError, "HLO program proposed by LLM",
                     rhs_exec_or.status().message());
     return rhs_exec_or.status();
   }
@@ -562,7 +718,7 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
         lhs_exec.get(), ptrs, &profile);
     if (!result_or.ok()) {
       std::cerr << "Runtime error (LHS): " << result_or.status().message() << "\n";
-      PrintConclusion(HloCompConclusion::kRuntimeError, "LHS",
+      PrintConclusion(HloCompConclusion::kRuntimeError, "Original HLO Program",
                       result_or.status().message());
       return result_or.status();
     }
@@ -586,7 +742,7 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
         rhs_exec.get(), ptrs, &profile);
     if (!result_or.ok()) {
       std::cerr << "Runtime error (RHS): " << result_or.status().message() << "\n";
-      PrintConclusion(HloCompConclusion::kRuntimeError, "RHS",
+      PrintConclusion(HloCompConclusion::kRuntimeError, "HLO program proposed by LLM",
                       result_or.status().message());
       return result_or.status();
     }
@@ -621,11 +777,15 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
   std::cerr << "\nSuccess! LHS and RHS are equivalent across "
             << opts.iterations << " random inputs.\n";
 
-  PrintComparisonTable(lhs_metrics, rhs_metrics, avg_lhs_ms, avg_rhs_ms);
-
   HloCompConclusion verdict =
-      DetermineVerdict(lhs_metrics, rhs_metrics, avg_lhs_ms, avg_rhs_ms);
+      DetermineVerdict(lhs_metrics, rhs_metrics, avg_lhs_ms, avg_rhs_ms,
+                       lhs_raw_inst_count, rhs_raw_inst_count);
   PrintConclusion(verdict);
+  if (verdict == HloCompConclusion::kRhsBetter ||
+      verdict == HloCompConclusion::kRhsNotBetter) {
+    PrintComparisonTable(lhs_metrics, rhs_metrics, avg_lhs_ms, avg_rhs_ms,
+                         lhs_raw_inst_count, rhs_raw_inst_count);
+  }
   return absl::OkStatus();
 }
 

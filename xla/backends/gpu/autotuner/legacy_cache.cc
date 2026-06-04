@@ -23,6 +23,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/autotune_results.pb.h"
 #include "xla/autotuning.pb.h"
@@ -32,6 +33,7 @@ limitations under the License.
 #include "xla/service/gpu/autotuning/autotuner_util.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/protobuf/dnn.pb.h"
+#include "xla/tsl/util/proto/proto_utils.h"
 
 namespace xla {
 
@@ -143,6 +145,13 @@ std::optional<AutotuneResult> LegacyCache::GetAutotuneResult(
   } else {
     result.mutable_other()->set_name(config.codegen_backend_name);
     *result.mutable_other()->mutable_config() = config.backend_config;
+  }
+  // Persist the measured runtime of the best config (when it was profiled) so
+  // consumers of the autotune cache can reuse it as a measured kernel time,
+  // matching what GemmFusionAutotuner already does for Triton fusions.
+  if (config.duration > absl::ZeroDuration()) {
+    *result.mutable_run_time() =
+        tsl::proto_utils::ToDurationProto(config.duration);
   }
   return result;
 }

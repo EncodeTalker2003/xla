@@ -645,6 +645,11 @@ xla_cc_binary(
 
 				# --- GPU Performance Model ---
         "//xla/service/gpu:cublas_cudnn",
+        "//xla/service/gpu/autotuning:autotune_cache_key",
+        "//xla/service/gpu/autotuning:autotuner_util",
+        "//xla:autotuning_proto_cc",
+        "//xla:autotune_results_proto_cc",
+        "//xla/service/gpu:ir_emission_utils",
         "//xla/service/gpu/model:gpu_hlo_cost_analysis",
         "//xla/service/gpu/model:gpu_performance_model",
         "//xla/service/gpu/model:gpu_performance_model_base",
