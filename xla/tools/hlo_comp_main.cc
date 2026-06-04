@@ -394,6 +394,14 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
         .mutable_debug_options()
         .add_xla_disable_hlo_passes("algsimp");
     xla::Compiler::CompileOptions compile_options;
+    // The autotune cache is process-global and accumulates results across both
+    // the LHS and RHS cost-analysis passes. Because LHS and RHS are equivalent
+    // programs, their conv/gemm kernels often share identical output shapes,
+    // which defeats the shape-based disambiguation in match_measured_time below
+    // (it sees the other module's kernel as a second candidate and gives up).
+    // Reset the cache so this module's RunHloPasses repopulates it with only its
+    // own measured run-times.
+    gpu::AutotunerUtil::ClearAutotuneResults();
     auto pass_status = compiler->RunHloPasses(std::move(cost_module), executor,
                                               compile_options);
     if (!pass_status.ok()) {
@@ -444,17 +452,17 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
         for (const auto& e : harvested.results()) {
           const AutotuneResult& r = e.result();
           if (!r.has_run_time()) continue;               // no measurement stored
-					std::cout << "Find sth interesting" << std::endl;
+					// std::cout << "Find sth interesting" << std::endl;
           absl::Duration t = absl::Seconds(r.run_time().seconds()) +
                              absl::Nanoseconds(r.run_time().nanos());
           if (r.has_algorithm() || r.has_cuda_conv_plan()) {
-						std::cout << "Push convolution time" << std::endl;
+						// std::cout << "Push convolution time" << std::endl;
             conv_times.push_back({e.hlo(), t});
           } else if (r.has_triton()) {
-						std::cout << "Push triton time" << std::endl;
+						// std::cout << "Push triton time" << std::endl;
             triton_times.push_back({e.hlo(), t});
           } else if (r.has_gemm()) {
-						std::cout << "Push gemm time" << std::endl;
+						// std::cout << "Push gemm time" << std::endl;
             cublas_times.push_back({e.hlo(), t});
           }
         }
@@ -478,7 +486,10 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
       const MeasuredKernel* hit = nullptr;
       for (const auto& k : bucket) {
         if (absl::StrContains(k.hlo, shape_str)) {
-          if (hit != nullptr) return std::nullopt;  // ambiguous
+          if (hit != nullptr) {
+						std::cout << "Warning: multiple matches in autotune cache" << std::endl;
+						return std::nullopt;  // ambiguous
+					}
           hit = &k;
         }
       }
