@@ -632,6 +632,7 @@ xla_cc_binary(
         "//xla:literal",
         "//xla:literal_comparison",
         "//xla:shape_util",
+        "//xla/hlo/ir:hlo",
         
         # 运行时与平台调度
         "//xla/service:hlo_runner",
@@ -670,6 +671,7 @@ xla_cc_binary(
         "//xla/tsl/util:command_line_flags",
         
         # 基础库
+        "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",

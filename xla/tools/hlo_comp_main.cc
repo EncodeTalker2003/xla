@@ -9,11 +9,13 @@
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "xla/error_spec.h"
+#include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/literal.h"
 #include "xla/literal_comparison.h"
 #include "xla/service/compiler.h"
@@ -66,6 +68,7 @@ enum class HloCompConclusion {
   kGrammarError,  // LHS or RHS failed to load / verify
   kRuntimeError,  // LHS or RHS failed to compile or execute
   kNotEquivalent, // outputs differ, or incompatible signatures
+  kRhsForbiddenOp,// RHS contains an operator that XLA passes would expand
   kRhsNotBetter,  // equivalent but RHS is not more profitable
   kRhsBetter,     // equivalent and RHS is more profitable
 };
@@ -101,6 +104,11 @@ void PrintConclusion(HloCompConclusion conclusion,
     case HloCompConclusion::kNotEquivalent:
       std::cout << "CONCLUSION: Original HLO Program and HLO program proposed by LLM are not equivalent" << std::endl;
       append_detail();
+      break;
+    case HloCompConclusion::kRhsForbiddenOp:
+      std::cout << "CONCLUSION: HLO program proposed by LLM contains a forbidden operator" << std::endl;
+      append_detail();
+      std::cout << "\n";
       break;
     case HloCompConclusion::kRhsNotBetter:
       std::cout << "CONCLUSION: HLO program proposed by LLM is not more profitable than Original HLO Program" << std::endl;
@@ -342,6 +350,25 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
   int64_t rhs_raw_inst_count =
       rhs_module->entry_computation()->instruction_count();
   std::cerr << "[RHS] Raw instruction count: " << rhs_raw_inst_count << "\n";
+
+  // ── Phase 1c: Reject forbidden operators in RHS ──────────────────────────
+  // These ops are expanded by later XLA compilation passes, so an RHS that
+  // contains them cannot be faithfully compared. Reject before compilation.
+  static constexpr HloOpcode kForbiddenOpcodes[] = {
+      HloOpcode::kLogistic, HloOpcode::kBatchNormInference,
+      HloOpcode::kBatchNormTraining, HloOpcode::kBatchNormGrad};
+  for (const HloComputation* comp : rhs_module->MakeNonfusionComputations()) {
+    for (const HloInstruction* instr : comp->instructions()) {
+      if (absl::c_linear_search(kForbiddenOpcodes, instr->opcode())) {
+        std::string op = std::string(HloOpcodeString(instr->opcode()));
+        std::cerr << "Forbidden op in RHS: " << op << "\n";
+        PrintConclusion(HloCompConclusion::kRhsForbiddenOp,
+                        "HLO program proposed by LLM", op);
+        return absl::InvalidArgumentError(
+            absl::StrCat("RHS contains forbidden operator: ", op));
+      }
+    }
+  }
 
   // ── Phase 2: Signature check ──────────────────────────────────────────────
   const auto* lhs_entry = lhs_module->entry_computation();
