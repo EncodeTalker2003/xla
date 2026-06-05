@@ -70,6 +70,13 @@ enum class HloCompConclusion {
   kRhsBetter,     // equivalent and RHS is more profitable
 };
 
+// A verdict plus a short, human-readable explanation of why RHS is / isn't more
+// profitable than LHS (names the deciding metric; no concrete numbers).
+struct Verdict {
+  HloCompConclusion conclusion;
+  std::string reason;
+};
+
 // Prints the final conclusion to stdout.
 // `side` should be "LHS" or "RHS" for kGrammarError and kRuntimeError.
 // `error_detail` is appended to the conclusion line for those two kinds so
@@ -97,10 +104,11 @@ void PrintConclusion(HloCompConclusion conclusion,
       break;
     case HloCompConclusion::kRhsNotBetter:
       std::cout << "CONCLUSION: HLO program proposed by LLM is not more profitable than Original HLO Program" << std::endl;
-      append_detail();
+      if (!error_detail.empty()) std::cout << "REASON: " << error_detail << "\n";
       break;
     case HloCompConclusion::kRhsBetter:
       std::cout << "CONCLUSION: HLO program proposed by LLM is more profitable than Original HLO Program" << std::endl;
+      if (!error_detail.empty()) std::cout << "REASON: " << error_detail << "\n";
       break;
   }
   std::cout.flush();
@@ -130,11 +138,11 @@ struct CostMetrics {
 // Determines whether RHS is more profitable than LHS using a priority-order
 // comparison. When static metrics are unavailable, falls back to real exec time
 // only (>5% threshold required for kRhsBetter).
-HloCompConclusion DetermineVerdict(const std::optional<CostMetrics>& lhs_opt,
-                                   const std::optional<CostMetrics>& rhs_opt,
-                                   double avg_lhs_ms, double avg_rhs_ms,
-                                   int64_t lhs_raw_inst_count,
-                                   int64_t rhs_raw_inst_count) {
+Verdict DetermineVerdict(const std::optional<CostMetrics>& lhs_opt,
+                         const std::optional<CostMetrics>& rhs_opt,
+                         double avg_lhs_ms, double avg_rhs_ms,
+                         int64_t lhs_raw_inst_count,
+                         int64_t rhs_raw_inst_count) {
   constexpr double kThreshold = 0.05;
 
   if (lhs_opt && rhs_opt) {
@@ -145,52 +153,35 @@ HloCompConclusion DetermineVerdict(const std::optional<CostMetrics>& lhs_opt,
     double lhbm = static_cast<double>(lm.total_hbm_bytes);
     double rhbm = static_cast<double>(rm.total_hbm_bytes);
 
-    
+		if (rhs_raw_inst_count > lhs_raw_inst_count + 10) {
+			return {HloCompConclusion::kRhsNotBetter,
+			        "RHS has significantly more instructions than LHS"};
+			}
 
 		if (rhs_static_ms < lhs_static_ms * 0.98 || rhs_static_ms < lhs_static_ms - 0.01) {
-			return HloCompConclusion::kRhsBetter;
+			return {HloCompConclusion::kRhsBetter,
+			        "RHS has lower estimated execution time than LHS"};
 		} else if (lhs_static_ms < rhs_static_ms * 0.98 || lhs_static_ms < rhs_static_ms - 0.01) {
-			return HloCompConclusion::kRhsNotBetter;
+			return {HloCompConclusion::kRhsNotBetter,
+			        "RHS has higher estimated execution time than LHS"};
 		} else if (rhs_raw_inst_count < lhs_raw_inst_count * 0.7) {
-			return HloCompConclusion::kRhsBetter;
+			return {HloCompConclusion::kRhsBetter,
+			        "RHS has significantly fewer instructions (execution times "
+			        "comparable)"};
 		} else {
-			return HloCompConclusion::kRhsNotBetter;
+			return {HloCompConclusion::kRhsNotBetter,
+			        "RHS is not faster and does not significantly reduce instruction "
+			        "count"};
 		}
 	}
-    
-		/*
-		// Priority order: FLOPs → HBM → kernel count → real time → static time →
-    // instruction count.
-    if (lm.total_flops != rm.total_flops)
-      return (rm.total_flops < lm.total_flops) ? HloCompConclusion::kRhsBetter
-                                               : HloCompConclusion::kRhsNotBetter;
-    if (rhbm < lhbm * (1.0 - kThreshold))
-      return HloCompConclusion::kRhsBetter;
-    if (lhbm < rhbm * (1.0 - kThreshold))
-      return HloCompConclusion::kRhsNotBetter;
-    if (lm.kernel_count != rm.kernel_count)
-      return (rm.kernel_count < lm.kernel_count) ? HloCompConclusion::kRhsBetter
-                                                 : HloCompConclusion::kRhsNotBetter;
-    if (avg_rhs_ms < avg_lhs_ms * (1.0 - kThreshold))
-      return HloCompConclusion::kRhsBetter;
-    if (avg_lhs_ms < avg_rhs_ms * (1.0 - kThreshold))
-      return HloCompConclusion::kRhsNotBetter;
-    if (rhs_static_ms < lhs_static_ms * (1.0 - kThreshold))
-      return HloCompConclusion::kRhsBetter;
-    if (lhs_static_ms < rhs_static_ms * (1.0 - kThreshold))
-      return HloCompConclusion::kRhsNotBetter;
-    if (lm.instruction_count != rm.instruction_count)
-      return (rm.instruction_count < lm.instruction_count)
-                 ? HloCompConclusion::kRhsBetter
-                 : HloCompConclusion::kRhsNotBetter;
-    return HloCompConclusion::kRhsNotBetter;  // all metrics tied
-  }
-		*/
 
   // Static metrics unavailable — fall back to real exec time only.
   if (avg_rhs_ms < avg_lhs_ms * 0.98 || avg_rhs_ms < avg_lhs_ms - 0.01)
-    return HloCompConclusion::kRhsBetter;
-  return HloCompConclusion::kRhsNotBetter;
+    return {HloCompConclusion::kRhsBetter,
+            "RHS has lower measured execution time (static metrics unavailable)"};
+  return {HloCompConclusion::kRhsNotBetter,
+          "RHS is not faster in measured execution time (static metrics "
+          "unavailable)"};
 }
 
 // ── Comparison table (pure printer, no verdict) ───────────────────────────────
@@ -788,12 +779,12 @@ absl::Status RunHloComp(const HloCompConfig& opts) {
   std::cerr << "\nSuccess! LHS and RHS are equivalent across "
             << opts.iterations << " random inputs.\n";
 
-  HloCompConclusion verdict =
+  Verdict verdict =
       DetermineVerdict(lhs_metrics, rhs_metrics, avg_lhs_ms, avg_rhs_ms,
                        lhs_raw_inst_count, rhs_raw_inst_count);
-  PrintConclusion(verdict);
-  if (verdict == HloCompConclusion::kRhsBetter ||
-      verdict == HloCompConclusion::kRhsNotBetter) {
+  PrintConclusion(verdict.conclusion, /*side=*/"", verdict.reason);
+  if (verdict.conclusion == HloCompConclusion::kRhsBetter ||
+      verdict.conclusion == HloCompConclusion::kRhsNotBetter) {
     PrintComparisonTable(lhs_metrics, rhs_metrics, avg_lhs_ms, avg_rhs_ms,
                          lhs_raw_inst_count, rhs_raw_inst_count);
   }
